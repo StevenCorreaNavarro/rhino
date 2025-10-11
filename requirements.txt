@@ -1,0 +1,4 @@
+# Este es un ejemplo. Debes poner solo las librerías que uses.
+# pandas
+# requests
+django==5.0.4  # Puedes especificar una versión si es necesario

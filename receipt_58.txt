@@ -1,0 +1,13 @@
+Mi Negocio
+Fecha: 2025-10-07 23:38:09
+Venta ID: 58
+--------------------------------
+Cant Producto              Total
+--------------------------------
+   1 almohada              6.000
+--------------------------------
+                   TOTAL $6.000
+                RECIBIDO $6.000
+                DEVUELTA $0
+--------------------------------
+Gracias por su compra
