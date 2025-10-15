@@ -3877,209 +3877,209 @@ class POSApp:
 
     # ---------- manage categories window ----------
     def manage_categories_window(self):
-       def creator():
-           win = tk.Toplevel(self.root)
-           win.title('Administrar categorías')
-           win.geometry('460x440')
-           win.resizable(False, False)
-           try: win.grab_set()
-           except: pass
-           win.transient(self.root)
-           win.lift(); win.focus_force()
-   
-           # Listbox con scrollbar
-           frame_list = ttk.Frame(win, padding=8)
-           frame_list.pack(fill=tk.BOTH, expand=False)
-           scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL)
-           listbox = tk.Listbox(frame_list, width=50, height=12, yscrollcommand=scrollbar.set)
-           scrollbar.config(command=listbox.yview)
-           listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-           scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-   
-           # Load / refresh
-           def refresh():
-               listbox.delete(0, tk.END)
-               try:
-                   cats = get_categories()
-               except Exception:
-                   # si get_categories espera conn: intentar con conn global o self.conn
-                   try:
-                       cats = get_categories(conn)
-                   except:
-                       try:
-                           cats = get_categories(self.conn)
-                       except:
-                           cats = []
-               # cats puede venir como [(id,name),...] o list of dicts
-               for c in cats:
-                   try:
-                       if isinstance(c, dict):
-                           cid = c.get('id'); name = c.get('name')
-                       else:
-                           # tupla/row
-                           cid = c[0]; name = c[1]
-                       listbox.insert(tk.END, f"{cid} - {name}")
-                   except Exception:
-                       # forma fallback
-                       listbox.insert(tk.END, str(c))
-   
-           refresh()
-   
-           # Formulario de edición/creación
-           form = ttk.Frame(win, padding=(8,6))
-           form.pack(fill=tk.X)
-           ttk.Label(form, text='Nombre:').grid(row=0, column=0, sticky=tk.W)
-           name_var = tk.StringVar()
-           entry = ttk.Entry(form, textvariable=name_var, width=36)
-           entry.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
-           entry.bind('<Return>', lambda e: add_or_update())
-   
-           ttk.Label(form, text='Color (opcional hex):').grid(row=1, column=0, sticky=tk.W, pady=(6,0))
-           color_var = tk.StringVar(value="")
-           color_entry = ttk.Entry(form, textvariable=color_var, width=16)
-           color_entry.grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
-   
-           # Estado: si hay selección estamos en modo editar
-           editing_id = {'id': None}
-   
-           def select_current():
-               sel = listbox.curselection()
-               if not sel:
-                   editing_id['id'] = None
-                   name_var.set('')
-                   color_var.set('')
-                   return
-               text = listbox.get(sel[0])
-               try:
-                   cid = int(text.split(' - ')[0])
-               except:
-                   # fallback: intentar encontrar en get_categories
-                   try:
-                       cats = get_categories()
-                   except:
-                       try: cats = get_categories(conn)
-                       except:
-                           try: cats = get_categories(self.conn)
-                           except: cats = []
-                   cid = None
-                   for c in cats:
-                       if isinstance(c, dict) and c.get('name') in text:
-                           cid = c.get('id'); break
-                       elif isinstance(c, (list,tuple)) and str(c[1]) in text:
-                           cid = c[0]; break
-               if cid is None:
-                   editing_id['id'] = None
-                   return
-               editing_id['id'] = cid
-               # obtener nombre y color del helper
-               try:
-                   cats = get_categories()
-               except:
-                   try: cats = get_categories(conn)
-                   except:
-                       try: cats = get_categories(self.conn)
-                       except: cats = []
-               for c in cats:
-                   try:
-                       if (isinstance(c, dict) and c.get('id') == cid) or (not isinstance(c, dict) and c[0] == cid):
-                           name = c.get('name') if isinstance(c, dict) else c[1]
-                           color = c.get('color') if isinstance(c, dict) else (c[2] if len(c)>2 else "")
-                           name_var.set(name or "")
-                           color_var.set(color or "")
-                           break
-                   except:
-                       pass
-   
-           # Add or update depending on selection
-           def add_or_update():
-               name = name_var.get().strip()
-               color = color_var.get().strip() or None
-               if not name:
-                   messagebox.showwarning('Aviso', 'Escribe un nombre')
-                   return
-               cid = editing_id.get('id')
-               if cid:
-                   # UPDATE
-                   try:
-                       # prefer helper update_category
-                       if 'update_category' in globals():
-                           if color is not None:
-                               update_category(conn if 'conn' in globals() else self.conn, cid, name=name, color=color, sort_order=None)
-                           else:
-                               update_category(conn if 'conn' in globals() else self.conn, cid, name=name)
-                       else:
-                           # fallback SQL
-                           cur = (conn if 'conn' in globals() else self.conn).cursor()
-                           if color is not None:
-                               cur.execute("UPDATE categories SET name=?, color=? WHERE id=?", (name, color, cid))
-                           else:
-                               cur.execute("UPDATE categories SET name=? WHERE id=?", (name, cid))
-                           (conn if 'conn' in globals() else self.conn).commit()
-                       messagebox.showinfo('Editado', 'Categoría actualizada')
-                   except Exception as e:
-                       messagebox.showerror('Error', f'No se pudo actualizar: {e}')
-               else:
-                   # INSERT
-                   try:
-                       if 'add_category' in globals():
-                           add_category(name)
-                       else:
-                           cur = (conn if 'conn' in globals() else self.conn).cursor()
-                           cur.execute("INSERT INTO categories (name) VALUES (?)", (name,))
-                           (conn if 'conn' in globals() else self.conn).commit()
-                       messagebox.showinfo('Creada', 'Categoría creada')
-                   except Exception as e:
-                       messagebox.showerror('Error', f'No se pudo crear categoría: {e}')
-               # limpiar y refrescar
-               name_var.set(''); color_var.set(''); editing_id['id'] = None
-               refresh()
-               try: self.reload_category_buttons()
-               except: pass
-   
-           def delete():
-               sel = listbox.curselection()
-               if not sel:
-                   messagebox.showwarning('Aviso', 'Selecciona una categoría')
-                   return
-               text = listbox.get(sel[0])
-               try:
-                   cid = int(text.split(' - ')[0])
-               except:
-                   messagebox.showerror('Error', 'Formato de entrada inesperado'); return
-               if messagebox.askyesno('Confirmar', 'Eliminar categoría? (No borra productos)'):
-                   try:
-                       if 'delete_category' in globals():
-                           delete_category(cid)
-                       else:
-                           cur = (conn if 'conn' in globals() else self.conn).cursor()
-                           cur.execute("DELETE FROM categories WHERE id=?", (cid,))
-                           (conn if 'conn' in globals() else self.conn).commit()
-                       messagebox.showinfo('Eliminada', 'Categoría eliminada')
-                   except Exception as e:
-                       messagebox.showerror('Error', f'No se pudo eliminar: {e}')
-                   # limpiar y refrescar
-                   name_var.set(''); color_var.set(''); editing_id['id'] = None
-                   refresh()
-                   try: self.reload_category_buttons()
-                   except: pass
-   
-           # Botones
-           btnf = ttk.Frame(win, padding=(8,6))
-           btnf.pack(fill=tk.X)
-           ttk.Button(btnf, text='Nuevo', command=lambda: (editing_id.update({'id': None}), name_var.set(''), color_var.set(''))).pack(side=tk.LEFT, padx=6)
-           ttk.Button(btnf, text='Guardar / Renombrar', command=add_or_update).pack(side=tk.LEFT, padx=6)
-           ttk.Button(btnf, text='Eliminar', command=delete).pack(side=tk.LEFT, padx=6)
-           ttk.Button(btnf, text='Cerrar (Esc)', command=win.destroy).pack(side=tk.RIGHT, padx=6)
-   
-           # Bindings
-           listbox.bind('<<ListboxSelect>>', lambda e: select_current())
-           listbox.bind('<Double-Button-1>', lambda e: select_current())
-           win.bind('<Escape>', lambda e: win.destroy())
-   
-           # focus
-           entry.focus_set()
-           return win
-       return self.open_window_once('manage_categories', creator)
+        def creator():
+            win = tk.Toplevel(self.root)
+            win.title('Administrar categorías')
+            win.geometry('460x440')
+            win.resizable(False, False)
+            try: win.grab_set()
+            except: pass
+            win.transient(self.root)
+            win.lift(); win.focus_force()
+    
+            # Listbox con scrollbar
+            frame_list = ttk.Frame(win, padding=8)
+            frame_list.pack(fill=tk.BOTH, expand=False)
+            scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL)
+            listbox = tk.Listbox(frame_list, width=50, height=12, yscrollcommand=scrollbar.set)
+            scrollbar.config(command=listbox.yview)
+            listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+            # Load / refresh
+            def refresh():
+                listbox.delete(0, tk.END)
+                try:
+                    cats = get_categories()
+                except Exception:
+                    # si get_categories espera conn: intentar con conn global o self.conn
+                    try:
+                        cats = get_categories(conn)
+                    except:
+                        try:
+                            cats = get_categories(self.conn)
+                        except:
+                            cats = []
+                # cats puede venir como [(id,name),...] o list of dicts
+                for c in cats:
+                    try:
+                        if isinstance(c, dict):
+                            cid = c.get('id'); name = c.get('name')
+                        else:
+                            # tupla/row
+                            cid = c[0]; name = c[1]
+                        listbox.insert(tk.END, f"{cid} - {name}")
+                    except Exception:
+                        # forma fallback
+                        listbox.insert(tk.END, str(c))
+    
+            refresh()
+    
+            # Formulario de edición/creación
+            form = ttk.Frame(win, padding=(8,6))
+            form.pack(fill=tk.X)
+            ttk.Label(form, text='Nombre:').grid(row=0, column=0, sticky=tk.W)
+            name_var = tk.StringVar()
+            entry = ttk.Entry(form, textvariable=name_var, width=36)
+            entry.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+            entry.bind('<Return>', lambda e: add_or_update())
+    
+            ttk.Label(form, text='Color (opcional hex):').grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+            color_var = tk.StringVar(value="")
+            color_entry = ttk.Entry(form, textvariable=color_var, width=16)
+            color_entry.grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
+    
+            # Estado: si hay selección estamos en modo editar
+            editing_id = {'id': None}
+    
+            def select_current():
+                sel = listbox.curselection()
+                if not sel:
+                    editing_id['id'] = None
+                    name_var.set('')
+                    color_var.set('')
+                    return
+                text = listbox.get(sel[0])
+                try:
+                    cid = int(text.split(' - ')[0])
+                except:
+                    # fallback: intentar encontrar en get_categories
+                    try:
+                        cats = get_categories()
+                    except:
+                        try: cats = get_categories(conn)
+                        except:
+                            try: cats = get_categories(self.conn)
+                            except: cats = []
+                    cid = None
+                    for c in cats:
+                        if isinstance(c, dict) and c.get('name') in text:
+                            cid = c.get('id'); break
+                        elif isinstance(c, (list,tuple)) and str(c[1]) in text:
+                            cid = c[0]; break
+                if cid is None:
+                    editing_id['id'] = None
+                    return
+                editing_id['id'] = cid
+                # obtener nombre y color del helper
+                try:
+                    cats = get_categories()
+                except:
+                    try: cats = get_categories(conn)
+                    except:
+                        try: cats = get_categories(self.conn)
+                        except: cats = []
+                for c in cats:
+                    try:
+                        if (isinstance(c, dict) and c.get('id') == cid) or (not isinstance(c, dict) and c[0] == cid):
+                            name = c.get('name') if isinstance(c, dict) else c[1]
+                            color = c.get('color') if isinstance(c, dict) else (c[2] if len(c)>2 else "")
+                            name_var.set(name or "")
+                            color_var.set(color or "")
+                            break
+                    except:
+                        pass
+    
+            # Add or update depending on selection
+            def add_or_update():
+                name = name_var.get().strip()
+                color = color_var.get().strip() or None
+                if not name:
+                    messagebox.showwarning('Aviso', 'Escribe un nombre')
+                    return
+                cid = editing_id.get('id')
+                if cid:
+                    # UPDATE
+                    try:
+                        # prefer helper update_category
+                        if 'update_category' in globals():
+                            if color is not None:
+                                update_category(conn if 'conn' in globals() else self.conn, cid, name=name, color=color, sort_order=None)
+                            else:
+                                update_category(conn if 'conn' in globals() else self.conn, cid, name=name)
+                        else:
+                            # fallback SQL
+                            cur = (conn if 'conn' in globals() else self.conn).cursor()
+                            if color is not None:
+                                cur.execute("UPDATE categories SET name=?, color=? WHERE id=?", (name, color, cid))
+                            else:
+                                cur.execute("UPDATE categories SET name=? WHERE id=?", (name, cid))
+                            (conn if 'conn' in globals() else self.conn).commit()
+                        messagebox.showinfo('Editado', 'Categoría actualizada')
+                    except Exception as e:
+                        messagebox.showerror('Error', f'No se pudo actualizar: {e}')
+                else:
+                    # INSERT
+                    try:
+                        if 'add_category' in globals():
+                            add_category(name)
+                        else:
+                            cur = (conn if 'conn' in globals() else self.conn).cursor()
+                            cur.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+                            (conn if 'conn' in globals() else self.conn).commit()
+                        messagebox.showinfo('Creada', 'Categoría creada')
+                    except Exception as e:
+                        messagebox.showerror('Error', f'No se pudo crear categoría: {e}')
+                # limpiar y refrescar
+                name_var.set(''); color_var.set(''); editing_id['id'] = None
+                refresh()
+                try: self.reload_category_buttons()
+                except: pass
+    
+            def delete():
+                sel = listbox.curselection()
+                if not sel:
+                    messagebox.showwarning('Aviso', 'Selecciona una categoría')
+                    return
+                text = listbox.get(sel[0])
+                try:
+                    cid = int(text.split(' - ')[0])
+                except:
+                    messagebox.showerror('Error', 'Formato de entrada inesperado'); return
+                if messagebox.askyesno('Confirmar', 'Eliminar categoría? (No borra productos)'):
+                    try:
+                        if 'delete_category' in globals():
+                            delete_category(cid)
+                        else:
+                            cur = (conn if 'conn' in globals() else self.conn).cursor()
+                            cur.execute("DELETE FROM categories WHERE id=?", (cid,))
+                            (conn if 'conn' in globals() else self.conn).commit()
+                        messagebox.showinfo('Eliminada', 'Categoría eliminada')
+                    except Exception as e:
+                        messagebox.showerror('Error', f'No se pudo eliminar: {e}')
+                    # limpiar y refrescar
+                    name_var.set(''); color_var.set(''); editing_id['id'] = None
+                    refresh()
+                    try: self.reload_category_buttons()
+                    except: pass
+    
+            # Botones
+            btnf = ttk.Frame(win, padding=(8,6))
+            btnf.pack(fill=tk.X)
+            ttk.Button(btnf, text='Nuevo', command=lambda: (editing_id.update({'id': None}), name_var.set(''), color_var.set(''))).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text='Guardar / Renombrar', command=add_or_update).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text='Eliminar', command=delete).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text='Cerrar (Esc)', command=win.destroy).pack(side=tk.RIGHT, padx=6)
+    
+            # Bindings
+            listbox.bind('<<ListboxSelect>>', lambda e: select_current())
+            listbox.bind('<Double-Button-1>', lambda e: select_current())
+            win.bind('<Escape>', lambda e: win.destroy())
+    
+            # focus
+            entry.focus_set()
+            return win
+        return self.open_window_once('manage_categories', creator)
    
     # ---------- add product window ----------
     def open_add_product_window(self):
