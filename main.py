@@ -5,13 +5,21 @@ main.py - Registradora con Tkinter + SQLite
 - Ejecutar: python main.py
 - La BD se crea en app/database/punto_ventas.db
 """
+
 import tkinter as tk
+from tkinter import ttk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, simpledialog
 import sqlite3
+# from tkinter import csv
 import uuid
 import os
+import csv
 from datetime import datetime
 from tkinter import filedialog  # si ya lo importaste arriba, no hace falta duplicar
+import json
+from PIL import Image, ImageTk  # Importar desde Pillow
+
 
 # Requiere: pip install reportlab
 try:
@@ -234,11 +242,59 @@ def init_db():
         FOREIGN KEY (debt_id) REFERENCES debts(id)
     )
     """)
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS sale_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sale_id INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        details TEXT,
+        created_at TEXT,
+        FOREIGN KEY(sale_id) REFERENCES sales(id)
+    )
+    """)
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS adjustments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT,
+        reference_id INTEGER,
+        note TEXT,
+        amount INTEGER,
+        user TEXT,
+        created_at TEXT
+    )
+    """)
+    
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS cash_closures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user TEXT,
+        opened_at TEXT,
+        closed_at TEXT,
+        opening_cash INTEGER DEFAULT 0,
+        cash_in_sales INTEGER DEFAULT 0,
+        cash_expenses INTEGER DEFAULT 0,
+        cash_counted INTEGER DEFAULT 0,
+        cash_diff INTEGER DEFAULT 0,
+        total_sales INTEGER DEFAULT 0,
+        payments_summary TEXT,
+        notes TEXT,
+        created_at TEXT
+    )
+    """)
 
     conn.commit()
+        
+    c.execute("""CREATE TABLE IF NOT EXISTS paid_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_name TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        note TEXT,
+        created_at TEXT
+    )""")
+    conn.commit()
     
-
-
 
     c.execute("""
     CREATE TABLE IF NOT EXISTS sale_items (
@@ -257,7 +313,7 @@ def init_db():
     # insertar 10 categorias por defecto si tabla vacía
     c.execute("SELECT COUNT(*) as cnt FROM categories")
     if c.fetchone()["cnt"] == 0:
-        defaults = [f"Categoría {i}" for i in range(1, 11)]
+        defaults = [f"CATEGORIA {i}" for i in range(1, 11)]
         for name in defaults:
             try:
                 c.execute("INSERT INTO categories (name) VALUES (?)", (name,))
@@ -270,10 +326,612 @@ def init_db():
 
 conn = init_db()
 
-# ---------------- DB HELPERS ----------------
+
+# ---------- helpers para ventas/pagos ----------
+def get_sales_total_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(total),0) as total_sales FROM sales WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    r = c.fetchone()
+    return int((r['total_sales'] if isinstance(r, dict) and 'total_sales' in r else (r[0] if r else 0)) or 0)
+
+def get_payments_summary_for_period(conn, start_dt, end_dt):
+    """
+    Devuelve lista de dicts: [{'method':..., 'total':..., 'count':...}, ...]
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT sp.method, SUM(sp.amount) as total, COUNT(DISTINCT sp.sale_id) as count
+        FROM sale_payments sp
+        JOIN sales s ON sp.sale_id = s.id
+        WHERE s.created_at BETWEEN ? AND ?
+        GROUP BY sp.method
+    """, (start_dt, end_dt))
+    return c.fetchall()
+
+# ---------- paid_orders ----------
+def add_paid_order(conn, customer_name, amount, note=None):
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
+    c = conn.cursor()
+    c.execute("INSERT INTO paid_orders (customer_name, amount, note, created_at) VALUES (?, ?, ?, ?)",
+              (customer_name, int(amount), note or "", now))
+    conn.commit()
+    return c.lastrowid
+
+def get_paid_orders_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT id, customer_name, amount, note, created_at FROM paid_orders WHERE created_at BETWEEN ? AND ? ORDER BY created_at ASC",
+              (start_dt, end_dt))
+    return c.fetchall()
+
+def sum_paid_orders_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(amount),0) as total FROM paid_orders WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    r = c.fetchone()
+    return int((r['total'] if isinstance(r, dict) and 'total' in r else (r[0] if r else 0)) or 0)
+
+# ---------- adjustments (gastos) ----------
+
+def _get_table_columns(conn, table):
+    cur = conn.cursor()
+    try:
+        cur.execute(f"PRAGMA table_info({table})")
+        return [r[1] if isinstance(r, (list,tuple)) else (r.get('name') if isinstance(r, dict) else None) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+def _detect_amount_column(conn, table):
+    # candidatos por nombre
+    candidates = ['amount','monto','total','value','importe','price','cost','amount_cents','monto_cents']
+    cols = _get_table_columns(conn, table)
+    for c in candidates:
+        if c in cols:
+            return c
+    # si no hay candidato por nombre, intentar inferir a partir de la primera fila
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT * FROM {table} LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return None
+        # si row es dict-like, verificamos tipos en valores
+        try:
+            rowd = dict(row)
+            for k,v in rowd.items():
+                if isinstance(v,(int,float)) and k in cols:
+                    return k
+        except Exception:
+            # tupla: probar por posición
+            for idx, colname in enumerate(cols):
+                try:
+                    val = row[idx]
+                    if isinstance(val,(int,float)):
+                        return colname
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+def get_adjustments_for_period(conn, start_dt, end_dt, table="adjustments"):
+    """
+    Devuelve lista de dicts con campos: id, kind, note, amount, user, created_at
+    Detecta la columna de monto automáticamente.
+    """
+    cur = conn.cursor()
+    col_amount = _detect_amount_column(conn, table)
+    if not col_amount:
+        # no se encontró columna de monto: devolver filas sin monto (0)
+        try:
+            cur.execute(f"SELECT * FROM {table} WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC", (start_dt, end_dt))
+            rows = cur.fetchall()
+            out = []
+            for r in rows:
+                try:
+                    row = dict(r)
+                except:
+                    # mapear por posiciones hasta 6 campos como fallback
+                    row = {
+                        "id": r[0] if len(r)>0 else None,
+                        "kind": r[1] if len(r)>1 else "",
+                        "note": r[2] if len(r)>2 else "",
+                        "amount": 0,
+                        "user": r[4] if len(r)>4 else "",
+                        "created_at": r[5] if len(r)>5 else ""
+                    }
+                row['amount'] = 0
+                out.append(row)
+            return out
+        except Exception as e:
+            print("Error get_adjustments_for_period_auto (no amount col):", e)
+            return []
+
+    # construir SELECT con la columna detectada renombrada como amount
+    sql = f"SELECT id, COALESCE(kind,'') as kind, COALESCE(note,'') as note, COALESCE({col_amount},0) as amount, COALESCE(user,'') as user, COALESCE(created_at,'') as created_at FROM {table} WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC"
+    try:
+        cur.execute(sql, (start_dt, end_dt))
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            try:
+                rr = dict(r)
+            except:
+                rr = {
+                    "id": r[0] if len(r)>0 else None,
+                    "kind": r[1] if len(r)>1 else "",
+                    "note": r[2] if len(r)>2 else "",
+                    "amount": r[3] if len(r)>3 else 0,
+                    "user": r[4] if len(r)>4 else "",
+                    "created_at": r[5] if len(r)>5 else ""
+                }
+            # normalizar monto a entero positivo
+            try:
+                rr['amount'] = abs(int(rr.get('amount') or 0))
+            except:
+                try:
+                    rr['amount'] = abs(int(float(rr.get('amount') or 0)))
+                except:
+                    rr['amount'] = 0
+            out.append(rr)
+        return out
+    except Exception as e:
+        print("Error get_adjustments_for_period_auto:", e)
+        return []
+
+def sum_adjustments_for_period(conn, start_dt, end_dt, table="adjustments"):
+    cur = conn.cursor()
+    col_amount = _detect_amount_column(conn, table)
+    if not col_amount:
+        return 0
+    try:
+        cur.execute(f"SELECT IFNULL(SUM({col_amount}),0) as total FROM {table} WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+        row = cur.fetchone()
+        try:
+            total = row['total'] if isinstance(row, dict) and 'total' in row else (row[0] if row else 0)
+        except:
+            total = row[0] if row else 0
+        try:
+            total = abs(int(total))
+        except:
+            try: total = abs(int(float(total)))
+            except: total = 0
+        return total
+    except Exception as e:
+        print("Error sum_adjustments_for_period_auto:", e)
+        return 0
+
+
+def sum_adjustments_for_period(conn, start_dt, end_dt, kind=None):
+    c = conn.cursor()
+    if kind:
+        c.execute("SELECT COALESCE(SUM(amount),0) as total FROM adjustments WHERE kind=? AND created_at BETWEEN ? AND ?", (kind, start_dt, end_dt))
+    else:
+        c.execute("SELECT COALESCE(SUM(amount),0) as total FROM adjustments WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    r = c.fetchone()
+    return int((r['total'] if isinstance(r, dict) and 'total' in r else (r[0] if r else 0)) or 0)
+
+# ---------- credits / debts ----------
+def sum_credits_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(amount),0) as total, COALESCE(SUM(balance),0) as balance FROM credits WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    r = c.fetchone()
+    t = int((r['total'] if isinstance(r, dict) and 'total' in r else (r[0] if r else 0)) or 0)
+    b = int((r['balance'] if isinstance(r, dict) and 'balance' in r else (r[1] if r else 0)) or 0)
+    return t, b
+
+def sum_debts_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(amount),0) as total, COALESCE(SUM(balance),0) as balance FROM debts WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    r = c.fetchone()
+    t = int((r['total'] if isinstance(r, dict) and 'total' in r else (r[0] if r else 0)) or 0)
+    b = int((r['balance'] if isinstance(r, dict) and 'balance' in r else (r[1] if r else 0)) or 0)
+    return t, b
+
+# ---------- export CSV helper ----------
+def export_cash_closure_csv(path, summary: dict, lists: dict, company_name="Mi Negocio"):
+    """
+    Exporta un cierre con estilo tipo factura a CSV.
+    - path: ruta destino (string)
+    - summary: diccionario con claves y totales (ej: 'total_sales', 'cash_in', ...)
+    - lists: diccionario con listas: 'payments' (iterable de filas), 'paid_orders', 'adjustments'
+    - company_name: nombre que aparecerá en el encabezado
+    """
+    import csv
+    from datetime import datetime
+
+    def _fmt(v):
+        # intenta usar format_money si existe, si no, formatea simple
+        try:
+            return format_money(int(v)) if (isinstance(v, (int, float)) or str(v).isdigit()) else str(v)
+        except Exception:
+            try:
+                return format_money(v)
+            except Exception:
+                try:
+                    return f"{int(v):,}"
+                except:
+                    return str(v)
+
+    # normalizar fuentes de listas
+    payments = lists.get("payments", [])
+    paid_orders = lists.get("paid_orders", [])
+    adjustments = lists.get("adjustments", [])
+
+    # abrir y escribir CSV (UTF-8, Excel-friendly)
+    with open(path, "w", newline="", encoding="utf-8") as csvfile:
+        w = csv.writer(csvfile)
+
+        # --- Encabezado tipo factura ---
+        w.writerow([company_name])
+        w.writerow(["CIERRE DE CAJA", summary.get("closed_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))])
+        w.writerow([])
+
+        # --- Resumen principal (lado izquierdo como clave: valor) ---
+        w.writerow(["---------RESUMEN-------------"])
+        # Orden de campos (intencionalmente legible)
+        ordered_keys = [
+            ("TOTAL VENTA---------", "total_sales"),
+            ("EFECTIVO------------", "cash_in"),
+            ("TRANSFERENCIA-------", "transfer_in"),
+            ("PEDIDOS PAGADOS-----", "paid_orders_total"),
+            ("adjustments_total---", "adjustments_total"),
+            ("TOTAL CREDITOS------", "credits_total"),
+            ("TOTAL EN DEUDAS-----", "debts_total"),
+            ("APERTURA------------", "opening"),
+            ("EFECTIVO CONTADO----", "counted"),
+            ("DIFERENCIA----------", "cash_diff")
+        ]
+        for label, key in ordered_keys:
+            if key in summary:
+                w.writerow([label, _fmt(summary.get(key))])
+        w.writerow([])
+
+        # --- Pagos: desglosado por método ---
+        w.writerow(["---------PAGOS (por método)---------"])
+        w.writerow(["Método", "Monto"])
+        # payments puede venir como lista de tuplas o rows; intentamos manejar ambos casos
+        if payments:
+            for p in payments:
+                # p puede ser dict, row de sqlite, o tupla (method, total)
+                try:
+                    if isinstance(p, dict):
+                        method = p.get("method") or p.get("method_name") or p.get("name") or ""
+                        amount = p.get("amount") or p.get("total") or p.get("sum") or ""
+                    else:
+                        # row-like: tratar como iterable
+                        method = getattr(p, "method", None) or (p[0] if len(p) > 0 else "")
+                        amount = getattr(p, "total", None) or (p[1] if len(p) > 1 else "")
+                except Exception:
+                    method = str(p)
+                    amount = ""
+                w.writerow([method, _fmt(amount)])
+        else:
+            w.writerow(["(sin registros)"])
+        w.writerow([])
+
+        # --- Pedidos pagados (detalle) ---
+        w.writerow(["---------PEDIDOS PAGADOS (detalle)---------"])
+        # encabezados: si paid_orders tiene dict-like podemos usar keys, sino usamos columnas por defecto
+        if paid_orders:
+            # intentar inferir columnas
+            first = paid_orders[0]
+            if isinstance(first, dict):
+                headers = list(first.keys())
+                w.writerow(headers)
+                for r in paid_orders:
+                    row = [r.get(h, "") for h in headers]
+                    # formatear montos detectados
+                    row = [(_fmt(x) if ("amount" in str(h).lower() or "total" in str(h).lower() or "monto" in str(h).lower()) else x) for x, h in zip(row, headers)]
+                    w.writerow(row)
+            else:
+                # tratar filas como tuplas: asumimos (id, cliente, monto, nota, created_at) u otra forma
+                # usar encabezado genérico
+                w.writerow(["ID", "Cliente", "Monto", "Nota/Detalle", "Fecha"])
+                for r in paid_orders:
+                    try:
+                        # si r es row-like con indices
+                        rid = r[0] if len(r)>0 else ""
+                        cliente = r[1] if len(r)>1 else ""
+                        monto = r[2] if len(r)>2 else ""
+                        nota = r[3] if len(r)>3 else ""
+                        fecha = r[4] if len(r)>4 else ""
+                    except Exception:
+                        rid = r
+                        cliente = monto = nota = fecha = ""
+                    w.writerow([rid, cliente, _fmt(monto), nota, fecha])
+        else:
+            w.writerow(["(sin pedidos pagados en el período)"])
+        w.writerow([])
+
+        # --- Ajustes / Gastos (detalle) ---
+        w.writerow(["---------GASTOS / AJUSTES (detalle)---------"])
+        if adjustments:
+            first = adjustments[0]
+            if isinstance(first, dict):
+                headers = list(first.keys())
+                w.writerow(headers)
+                for r in adjustments:
+                    row = [r.get(h, "") for h in headers]
+                    row = [(_fmt(x) if ("amount" in str(h).lower() or "monto" in str(h).lower()) else x) for x, h in zip(row, headers)]
+                    w.writerow(row)
+            else:
+                # columnas por defecto
+                w.writerow(["ID", "Tipo", "Nota", "Monto", "Usuario", "Fecha"])
+                for a in adjustments:
+                    try:
+                        aid = a[0] if len(a)>0 else ""
+                        kind = a[1] if len(a)>1 else ""
+                        note = a[2] if len(a)>2 else ""
+                        amt = a[3] if len(a)>3 else ""
+                        usr = a[4] if len(a)>4 else ""
+                        fecha = a[5] if len(a)>5 else ""
+                    except Exception:
+                        aid = kind = note = amt = usr = fecha = ""
+                    w.writerow([aid, kind, note, _fmt(amt), usr, fecha])
+        else:
+            w.writerow(["(sin ajustes/gastos en el período)"])
+        w.writerow([])
+
+        # --- Notas, firma y pie ---
+        w.writerow(["NOTAS"])
+        notes = summary.get("notes") or summary.get("observations") or ""
+        if notes:
+            # si la nota tiene saltos, escribirla en la misma celda (CSV lo permite)
+            w.writerow([notes])
+        else:
+            w.writerow(["-"])
+        w.writerow([])
+        w.writerow(["CAJERO", "__________________________", "FECHA", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+        w.writerow([])
+        w.writerow(["Generado por sistema POS"])
+
+    # fin archivo
+    return True
+
+
+
+
+    """
+    summary: dict con totales
+    lists: dict de tablas: {'sales': [...], 'paid_orders': [...], 'adjustments': [...]}
+    """
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Cierre de caja"])
+        w.writerow(["Fecha cierre", summary.get("closed_at")])
+        w.writerow([])
+        w.writerow(["RESUMEN"])
+        for k,v in summary.items():
+            w.writerow([k, v])
+        w.writerow([])
+        # Detalles
+        if 'paid_orders' in lists:
+            w.writerow(["Pedidos pagados (detalle)"])
+            w.writerow(["Cliente","Monto","Nota","Fecha"])
+            for r in lists['paid_orders']:
+                rr = dict(r) if hasattr(r, 'keys') else r
+                w.writerow([rr.get('customer_name') if isinstance(rr, dict) else rr[1],
+                            rr.get('amount') if isinstance(rr, dict) else rr[2],
+                            rr.get('note') if isinstance(rr, dict) else rr[3],
+                            rr.get('created_at') if isinstance(rr, dict) else rr[4]])
+            w.writerow([])
+
+        if 'adjustments' in lists:
+            w.writerow(["Ajustes / Gastos (detalle)"])
+            w.writerow(["ID","Tipo","Nota","Monto","Usuario","Fecha"])
+            for r in lists['adjustments']:
+                rr = dict(r) if hasattr(r, 'keys') else r
+                w.writerow([rr.get('id'), rr.get('kind'), rr.get('note'), rr.get('amount'), rr.get('user'), rr.get('created_at')])
+            w.writerow([])
+
+        # payments per method if present
+        if 'payments' in lists:
+            w.writerow(["Pagos por método"])
+            w.writerow(["Método","Total"])
+            for p in lists['payments']:
+                rp = dict(p) if hasattr(p, 'keys') else p
+                w.writerow([rp.get('method') if isinstance(rp, dict) else rp[0], rp.get('total') if isinstance(rp, dict) else rp[1]])
+    return path
+# ---------------- DB ayudas ----------------
+def add_sale_payment(sale_id, method, amount, details=None):
+    """Registra un pago para una venta (amount en enteros)."""
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO sale_payments (sale_id, method, amount, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (sale_id, method, int(amount), details, now)
+    )
+    conn.commit()
+    return c.lastrowid
+
+def get_sale_items_for_sales(start_dt, end_dt):
+    """
+    Resumen de productos vendidos entre start_dt y end_dt.
+    Devuelve filas con: product_id, product_code, product_name, qty, subtotal
+    start_dt / end_dt: strings con formato 'YYYY-MM-DD HH:MM:SS'
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT si.product_id,
+               si.product_code,
+               si.product_name,
+               SUM(si.qty) as qty,
+               SUM(si.qty * si.price) as subtotal
+        FROM sale_items si
+        JOIN sales s ON si.sale_id = s.id
+        WHERE s.created_at BETWEEN ? AND ?
+        GROUP BY si.product_id, si.product_code, si.product_name
+        ORDER BY qty DESC
+    """, (start_dt, end_dt))
+    return c.fetchall()
+
+def get_payments_summary(start_dt, end_dt):
+    """
+    Resumen de pagos por método entre fechas.
+    Devuelve filas con: method, total, sales_count
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT sp.method,
+               SUM(sp.amount) as total,
+               COUNT(DISTINCT sp.sale_id) as sales_count
+        FROM sale_payments sp
+        JOIN sales s ON sp.sale_id = s.id
+        WHERE s.created_at BETWEEN ? AND ?
+        GROUP BY sp.method
+        ORDER BY total DESC
+    """, (start_dt, end_dt))
+    return c.fetchall()
+
+def get_credits_summary(start_dt, end_dt):
+    """
+    Resumen simple de créditos creados en el periodo.
+    Devuelve dict-like (sqlite3.Row) con created, total_created, total_balance
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*) as created,
+               COALESCE(SUM(amount),0) as total_created,
+               COALESCE(SUM(balance),0) as total_balance
+        FROM credits
+        WHERE created_at BETWEEN ? AND ?
+    """, (start_dt, end_dt))
+    return c.fetchone()
+
+def get_debts_summary(start_dt, end_dt):
+    """
+    Resumen simple de deudas creadas en el periodo.
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*) as created,
+               COALESCE(SUM(amount),0) as total_created,
+               COALESCE(SUM(balance),0) as total_balance
+        FROM debts
+        WHERE created_at BETWEEN ? AND ?
+    """, (start_dt, end_dt))
+    return c.fetchone()
+
+def get_adjustments_summary(start_dt, end_dt):
+    """
+    Resumen de ajustes por tipo entre fechas.
+    Devuelve filas con kind, cnt, total_amount
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT kind, COUNT(*) as cnt, COALESCE(SUM(amount),0) as total_amount
+        FROM adjustments
+        WHERE created_at BETWEEN ? AND ?
+        GROUP BY kind
+        ORDER BY cnt DESC
+    """, (start_dt, end_dt))
+    return c.fetchall()
+
+def sum_order_payments_for_period(conn, start_dt, end_dt):
+    """
+    Suma pagos de order_payments entre start_dt y end_dt (strings 'YYYY-MM-DD HH:MM:SS').
+    Devuelve entero.
+    """
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(amount),0) as total FROM order_payments WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    row = c.fetchone()
+    # si row es sqlite3.Row usa row['total'] else row[0]
+    try:
+        return int(row['total'] or 0)
+    except Exception:
+        return int(row[0] or 0)
+
+def get_order_payments_list_for_period(conn, start_dt, end_dt):
+    """
+    Devuelve lista de pagos individuales por pedido en el periodo:
+    id, order_id, customer_name, amount, method, note, created_at
+    """
+    c = conn.cursor()
+    c.execute("""
+        SELECT op.id, op.order_id, o.customer_name, op.amount, op.method, op.note, op.created_at
+        FROM order_payments op
+        LEFT JOIN orders o ON op.order_id=o.id
+        WHERE op.created_at BETWEEN ? AND ?
+        ORDER BY op.created_at ASC
+    """, (start_dt, end_dt))
+    return c.fetchall()
+
+def get_total_sales_for_period(conn, start_dt, end_dt):
+    """
+    Suma la columna total de sales entre fechas.
+    """
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(total),0) as total_sales FROM sales WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    row = c.fetchone()
+    try:
+        return int(row['total_sales'] or 0)
+    except Exception:
+        return int(row[0] or 0)
+
+def export_orders_payments_summary_csv(conn, path, start_dt, end_dt):
+    """
+    Exporta CSV con filas: customer_name, order_id, amount y al final resumen.
+    """
+    rows = get_order_payments_list_for_period(conn, start_dt, end_dt)
+    total_payments = sum_order_payments_for_period(conn, start_dt, end_dt)
+    total_sales = get_total_sales_for_period(conn, start_dt, end_dt)
+    diff = total_sales - total_payments
+
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(["Cliente", "Order ID", "Monto", "Método", "Nota", "Fecha"])
+        for r in rows:
+            rr = dict(r) if hasattr(r, 'keys') else r
+            customer = rr.get('customer_name') if isinstance(rr, dict) else rr[2]
+            order_id = rr.get('order_id') if isinstance(rr, dict) else rr[1]
+            amount = rr.get('amount') if isinstance(rr, dict) else rr[3]
+            method = rr.get('method') if isinstance(rr, dict) else rr[4]
+            note = rr.get('note') if isinstance(rr, dict) else rr[5]
+            when = rr.get('created_at') if isinstance(rr, dict) else rr[6]
+            w.writerow([customer, order_id, amount, method, note, when])
+        # resumen
+        w.writerow([])
+        w.writerow(["Resumen"])
+        w.writerow(["Total pagos pedidos", total_payments])
+        w.writerow(["Total ventas periodo", total_sales])
+        w.writerow(["Diferencia (ventas - pagos pedidos)", diff])
+    return path
+
+def save_cash_closure(user, opened_at, closed_at, opening_cash, cash_in_sales,
+                      cash_expenses, cash_counted, total_sales, payments_summary, notes=None):
+    """
+    Guarda un cierre de caja. payments_summary debe ser un dict {method:amount,...}
+    Devuelve el id insertado.
+    """
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
+    c = conn.cursor()
+    ps_json = json.dumps(payments_summary or {}, ensure_ascii=False)
+    # calcular diferencia de caja (puedes adaptar la fórmula)
+    try:
+        cash_diff = int(cash_counted) - (int(opening_cash) + int(cash_in_sales) - int(cash_expenses or 0))
+    except Exception:
+        cash_diff = 0
+    c.execute("""
+        INSERT INTO cash_closures
+        (user, opened_at, closed_at, opening_cash, cash_in_sales, cash_expenses, cash_counted, cash_diff, total_sales, payments_summary, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user, opened_at, closed_at, int(opening_cash), int(cash_in_sales), int(cash_expenses or 0), int(cash_counted), int(cash_diff), int(total_sales), ps_json, notes or "", now))
+    conn.commit()
+    return c.lastrowid
+# ---------------- sale_payments helper ----------------
+def add_sale_payment(sale_id, method, amount, details=None):
+    """Registra un pago para una venta (amount en enteros)."""
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO sale_payments (sale_id, method, amount, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (sale_id, method, int(amount), details, now)
+    )
+    conn.commit()
+    return c.lastrowid
 
 
  #---------- Clientes (si no existen) ----------
+
 def add_customer_db(data):
     now = datetime.now().isoformat(sep=' ', timespec='seconds')
     c = conn.cursor()
@@ -515,7 +1173,71 @@ def get_outflows_in_range(start_date=None, end_date=None):
     total_out = total_row['total_out'] if total_row else 0
     return rows, total_out
 
+# CRUD y consultas mínimas para paid_orders
+def add_paid_order(conn, customer_name, amount, note=None):
+    now = datetime.now().isoformat(sep=' ', timespec='seconds')
+    c = conn.cursor()
+    c.execute("INSERT INTO paid_orders (customer_name, amount, note, created_at) VALUES (?, ?, ?, ?)",
+              (customer_name, int(amount), note or "", now))
+    conn.commit()
+    return c.lastrowid
 
+def delete_paid_order(conn, order_id):
+    c = conn.cursor()
+    c.execute("DELETE FROM paid_orders WHERE id=?", (order_id,))
+    conn.commit()
+    return c.rowcount
+
+def get_paid_orders_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT id, customer_name, amount, note, created_at FROM paid_orders WHERE created_at BETWEEN ? AND ? ORDER BY created_at ASC",
+              (start_dt, end_dt))
+    return c.fetchall()
+
+def sum_paid_orders_for_period(conn, start_dt, end_dt):
+    c = conn.cursor()
+    c.execute("SELECT COALESCE(SUM(amount),0) as total FROM paid_orders WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+    row = c.fetchone()
+    try:
+        return int(row['total'] or 0)
+    except Exception:
+        return int(row[0] or 0)
+
+def get_total_sales_for_period(conn, start_dt, end_dt):
+    """
+    Suma la tabla sales.total en el periodo. Si no tienes tabla sales, devuelve 0.
+    """
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COALESCE(SUM(total),0) as total_sales FROM sales WHERE created_at BETWEEN ? AND ?", (start_dt, end_dt))
+        row = c.fetchone()
+        try:
+            return int(row['total_sales'] or 0)
+        except Exception:
+            return int(row[0] or 0)
+    except Exception:
+        return 0
+
+def export_paid_orders_csv(conn, path, start_dt, end_dt):
+    rows = get_paid_orders_for_period(conn, start_dt, end_dt)
+    total = sum_paid_orders_for_period(conn, start_dt, end_dt)
+    total_sales = get_total_sales_for_period(conn, start_dt, end_dt)
+    diff = total_sales - total
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        w.writerow(["Cliente","Monto","Nota","Fecha"])
+        for r in rows:
+            rr = dict(r) if hasattr(r, 'keys') else r
+            if isinstance(rr, dict):
+                w.writerow([rr.get('customer_name'), rr.get('amount'), rr.get('note'), rr.get('created_at')])
+            else:
+                w.writerow([rr[1], rr[2], rr[3], rr[4]])
+        w.writerow([])
+        w.writerow(["Resumen"])
+        w.writerow(["Total pagos pedidos", total])
+        w.writerow(["Total ventas periodo", total_sales])
+        w.writerow(["Diferencia (ventas - pagos pedidos)", diff])
+    return path
 # def generate_receipt_text(sale_id, sale_rows, total, received=None, change=None, company_name="Mi Negocio"):
 #     def fm(x):
 #         try:
@@ -564,13 +1286,13 @@ def parse_money_to_int(value):
     except Exception:
         return 0
 
-def format_money(value):
-    """Formatea entero a '7.000'."""
-    try:
-        n = int(round(float(value)))
-        return f"{n:,}".replace(",", ".")
-    except Exception:
-        return "0"
+# def format_money(value):
+#     """Formatea entero a '7.000'."""
+#     try:
+#         n = int(round(float(value)))
+#         return f"{n:,}".replace(",", ".")
+#     except Exception:
+#         return "0"
 
 # ----------------- Generar texto del recibo -----------------
 def generate_receipt_text(sale_id, sale_rows, total, received=None, change=None, company_name="Mi Negocio"):
@@ -768,11 +1490,14 @@ def parse_money_to_int(value):
 
 def format_money(value):
     try:
-        value = float(str(value).replace(".", "").replace(",", "."))
-        return f"{int(value):,}".replace(",", ".")
-    except:
+        val = float(value)
+        if val > 1000000:  # por ejemplo si está en centavos
+            val /= 100
+        return f"{int(val):,}".replace(",", ".")
+    except Exception:
         return str(value)
-        
+
+
 def generate_unique_code():
     c = conn.cursor()
     while True:
@@ -923,11 +1648,96 @@ class POSApp:
     def __init__(self, master):
         self.master = master
         self.root = master
-        self.root.title("Registradora - POS")
+        self.root.title("Rhino")
         self.root.geometry("1024x600")
 
+
+
+
+        
+
+            # Fuente global
+        default_font = tkfont.Font(family="Segoe UI", size=10)
+        root.option_add("*Font", default_font)
+    
+        # Colores (puedes cambiar aquí)
+        PRIMARY = "#2B7A78"    # verde oscuro
+        ACCENT = "#17252A"     # casi negro
+        BG = "#F6F6F6"         # fondo claro
+        CARD = "#FFFFFF"       # tarjetas/blanco
+    
+        root.configure(bg=BG)
+    
+        # Estilo ttk
+        style = ttk.Style()
+        style.theme_use('default')  # usa default para control total
+
+
+        # Configurar estilos
+        style.configure("TFrame", background=BG)
+        style.configure("Card.TFrame", background=CARD, relief="flat")
+        style.configure("Header.TLabel", background=BG, font=("Segoe UI", 14, "bold"), foreground=ACCENT)
+        style.configure("TLabel", background=BG, foreground=ACCENT)
+        style.configure("Card.TLabel", background=CARD, foreground=ACCENT)
+        style.configure("TButton",  background=PRIMARY, foreground="white", padding=8, relief="flat")
+        # botón principal con estilo personalizado
+        style.map("TButton",    background=[("active", "#1f5f5d"), ("pressed", "#144F4D")])
+    
+        # Contenedor principal
+        container = ttk.Frame(root, padding=1, style="TFrame")
+        container.pack(fill="both")
+    
+        # Header
+        # header = ttk.Label(container, text="Rhino POS", style="Header.TLabel")
+        # header.pack(anchor="w", pady=(4,0))
+
+        # Abrir imagen (puede ser PNG o JPG)
+      
+        # Card (simula tarjeta con fondo blanco)
+        # card = ttk.Frame(container, style="Card.TFrame", padding=12)
+        # card.pack(fill="x", pady=(0,12))
+    
+        # Contenido de la tarjeta
+        # name_label = ttk.Label(card, text="Artículo", style="Card.TLabel")
+        # name_label.grid(row=0, column=0, sticky="w")
+        # price_label = ttk.Label(card, text="$ 12.000", style="Card.TLabel")
+        # price_label.grid(row=0, column=1, sticky="e")
+    
+        # desc = ttk.Label(card, text="Descripción breve del producto.", style="Card.TLabel")
+        # desc.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6,0))
+    
+        # Separador
+        # sep = ttk.Separator(container, orient="horizontal")
+        # sep.pack(fill="x", pady=8)
+    
+        # Botones
+        # btn_frame = ttk.Frame(container, style="TFrame")
+        # btn_frame.pack(fill="x")
+    
+        # add_btn = ttk.Button(btn_frame, text="Agregar", command=lambda: print("Agregar"))
+        # add_btn.pack(side="left", padx=(0,10))
+    
+        # pay_btn = ttk.Button(btn_frame, text="Pagar", command=lambda: print("Pagar"))
+        # pay_btn.pack(side="left")
+    
+        # Pie con info
+        # footer = ttk.Label(container, text="Status: listo", style="TLabel")
+        # footer.pack(anchor="w", pady=(12,0))
+
+
+
+
+
+
+
+
+
+
+
+
+
         # ===================== NAVBAR SUPERIOR =====================
-        navbar = ttk.Frame(self.root, padding=6, )
+        navbar = ttk.Frame(self.root, padding=5, )
         navbar.pack(side=tk.TOP, fill=tk.X)
 
        
@@ -937,35 +1747,57 @@ class POSApp:
     #    style.configure("Nav.TButton", background="#444", foreground="white", font=("Segoe UI", 10, "bold"))
     #    style.map("Nav.TButton", background=[("active", "#666")])
     # ttk.Button(navbar, text="🏠 Inicio", style="Nav.TButton", command=self.refresh_cart).pack(side=tk.LEFT, padx=4)
-# 
+    # 
        
 
         
         # Grupo 1 - Operaciones
         # ttk.Button(navbar, text="🏠 Inicio", command=self.refresh_cart).pack(side=tk.LEFT, padx=4)
         # ttk.Button(navbar, text="🛒 Caja / Venta", command=self.checkout).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="✍️ Registrar manual", command=self.open_calculator_mode).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="📦 Productos", command=self.open_add_product_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="💰 Créditos", command=self.open_credits_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="📉 Pasivos", command=self.open_debts_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="💸 Gastos", command=self.open_outflow_dialog).pack(side=tk.LEFT, padx=4)
+        ttk.Button(navbar, text="✍️ REGISTRO MANUAL", command=self.open_calculator_mode).pack(side=tk.LEFT, padx=0)
+                # Separador visual
+        # ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(navbar, text="📦 + PRODUCTO", command=self.open_add_product_window).pack(side=tk.LEFT, padx=0)
+        ttk.Button(navbar, text="💰 CREDITOS", command=self.open_credits_window).pack(side=tk.LEFT, padx=0)
+        ttk.Button(navbar, text="📉 DEUDAS", command=self.open_debts_window).pack(side=tk.LEFT, padx=0)
+        ttk.Button(navbar, text="💸 GASTOS", command=self.open_outflow_dialog).pack(side=tk.LEFT, padx=0)
+        ttk.Button(navbar, text="📦 PEDIDOS", command=self.open_paid_orders_window).pack(side=tk.LEFT, padx=0)
+
+
         
         # Separador visual
-        ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        # ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
         
         # Grupo 2 - Gestión / Administración
-        ttk.Button(navbar, text="📊 Estadísticas", command=self.open_stats_window).pack(side=tk.LEFT, padx=4)
+        ttk.Button(navbar, text="📊 ESTADISTICA", command=self.open_stats_window).pack(side=tk.LEFT, padx=0)
 
-        ttk.Button(navbar, text="🏭 Proveedores", command=self.open_suppliers_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="👥 Clientes", command=self.open_customer_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="🗂️ Categorías",  command=self.manage_categories_window).pack(side=tk.LEFT, padx=4)
-        ttk.Button(navbar, text="🧾 Historial", command=self.open_history_window).pack(side=tk.LEFT, padx=4)
+        ttk.Button(navbar, text="🏭 PROVEEDORES", command=self.open_suppliers_window).pack(side=tk.LEFT, padx=0)
+        # ttk.Button(navbar, text="👥 CLIENTES", command=self.open_customer_window).pack(side=tk.LEFT, padx=1)
+        ttk.Button(navbar, text="🗂️ CATEGORIAS",  command=self.manage_categories_window).pack(side=tk.LEFT, padx=0)
+        ttk.Button(navbar, text="🧾 HISTORIAL", command=self.open_history_window).pack(side=tk.LEFT, padx=0)
+                # Separador visual
+        # ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(navbar, text="💰 CIERRE DE CAJA", command=self.open_cash_closure_window).pack(side=tk.LEFT, padx=0, pady=0)
+
+
+
         
         # Separador final y botón de salida
-        ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(navbar, text="🚪 Salir", command=self.root.destroy).pack(side=tk.RIGHT, padx=6)
+        # ttk.Separator(navbar, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        
+        ttk.Button(navbar, text="🚪 SALIR", command=self.root.destroy).pack(side=tk.RIGHT, padx=0)
+        imagen = Image.open("img/rhinoo.png")
+        imagen = imagen.resize((150, 40))
+        imagen_tk = ImageTk.PhotoImage(imagen)
+        
+        label = tk.Label(root, image=imagen_tk)
+        label.imagen = imagen_tk  # Mantener referencia
+        # label.pack(pady=0)
+        label.pack(side="top",anchor='w', padx=0, pady=0)
+        
         # ===========================================================
-     # ttk.Button(actions_frame, text="ESTADISTICAS", command=self.open_stats_window).pack(side=tk.LEFT, padx=4)
+        # ttk.Button(actions_frame, text="ESTADISTICAS", command=self.open_stats_window).pack(side=tk.LEFT, padx=4)
         # ttk.Button(actions_frame, text="ADMINISTRAR CATEGORIAS", command=self.manage_categories_window).pack(side=tk.LEFT, padx=4)
         # ttk.Button(actions_frame, text="INVENTARIO", command=self.open_inventory_mode).pack(side=tk.LEFT, padx=4)
         # ttk.Button(actions_frame, text="PROVEEDORES", command=self.open_suppliers_window).pack(side=tk.LEFT, padx=4)
@@ -993,7 +1825,7 @@ class POSApp:
         
 
         # left: categories
-        ttk.Label(left, text="", font=(None, 12, 'bold')).pack(pady=(0,8))
+        ttk.Label(left, text="", font=(None, 12, 'bold')).pack(pady=(0,0))
         self.cat_frame = ttk.Frame(left)
         self.cat_frame.pack()
 
@@ -1017,9 +1849,9 @@ class POSApp:
         self.reload_category_buttons()
 
         # center: buscador y lista
-        ttk.Label(center, text="Variedades Sembrador", font=(None, 12, 'bold')).pack(anchor=tk.W)
+        # ttk.Label(center, text="Variedades Sembrador", font=(None, 12, 'bold')).pack(anchor=tk.W)
         sf = ttk.Frame(center)
-        sf.pack(fill=tk.X, pady=6)
+        sf.pack(fill=tk.X, pady=0)
         ttk.Label(sf, text="Buscar:").pack(side=tk.LEFT)
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(sf, textvariable=self.search_var)
@@ -1051,7 +1883,7 @@ class POSApp:
             self.products_tree.heading(c, text=c.capitalize())
         self.products_tree.column('id', width=5, anchor=tk.CENTER)
         self.products_tree.column('Codigo', width=50, anchor=tk.CENTER)
-        self.products_tree.column('Articulo', width=90, anchor=tk.CENTER)
+        self.products_tree.column('Articulo', width=90)
         self.products_tree.column('Precio', width=50, anchor=tk.E)
         self.products_tree.column('stock', width=20, anchor=tk.E)
         self.products_tree.column('Categoria', width=50, anchor=tk.CENTER)
@@ -1124,19 +1956,20 @@ class POSApp:
         
 
         # right: cart
-        ttk.Label(right, text="Carrito", font=(None, 12, 'bold')).pack()
-        self.cart_listbox = tk.Listbox(right, width=80, height=24)
+        ttk.Label(right, text="CARRITO", font=(None, 12, 'bold')).pack()
+        self.cart_listbox = tk.Listbox(right, width=80, height=19)
         self.cart_listbox.pack(pady=6)
-        ttk.Button(right, text="Eliminar seleccionado", command=self.remove_selected_cart_item).pack(fill=tk.X, pady=3)
-        ttk.Button(right, text="Vaciar carrito", command=self.clear_cart).pack(fill=tk.X, pady=3)
-        self.total_var = tk.StringVar(value="Total: $0")
-        ttk.Label(right, textvariable=self.total_var, font=(None, 11, 'bold')).pack(pady=6)
-        ttk.Button(right, text="Finalizar venta (Ctrl+Enter)", command=self.checkout).pack(fill=tk.X, pady=3)
         
-
+        ttk.Button(right, text="Eliminar seleccionado", command=self.remove_selected_cart_item).pack(side="bottom",fill=tk.X, pady=3)
+        ttk.Button(right, text="Vaciar carrito", command=self.clear_cart).pack(side="bottom",fill=tk.X, pady=3)
+        self.total_var = tk.StringVar(value="Total: $0")
+        ttk.Label(right, textvariable=self.total_var, font=(None, 25, 'bold')).pack(side="bottom",pady=6)
+        ttk.Button(right,text="Finalizar venta (Ctrl+Enter)", command=self.checkout).pack(side="bottom", fill=tk.X, pady=3, ipadx=15, ipady=20)
+        
         # global bindings
         self.root.bind('<Control-Return>', lambda e: self.checkout())
         self.root.bind('<Escape>', lambda e: self.close_active_window())
+        
     def load_categories(self):
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -1320,6 +2153,507 @@ class POSApp:
     
         return self.open_window_once("calculator_mode", creator)
 
+
+
+
+        """
+        Ventana que lista pagos de pedidos por periodo, suma pagos, resta del total de ventas y permite exportar CSV.
+        """
+        def creator():
+            win = tk.Toplevel(self.root)
+            win.title("Pagos pedidos — Resumen y comparación con ventas")
+            win.geometry("820x560")
+            try: win.grab_set()
+            except: pass
+            win.lift(); win.focus_force()
+    
+            top = ttk.Frame(win, padding=8); top.pack(fill=tk.X)
+            ttk.Label(top, text="Desde (YYYY-MM-DD HH:MM:SS):").pack(side=tk.LEFT)
+            from_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 00:00:00"))
+            ttk.Entry(top, textvariable=from_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Label(top, text="Hasta:").pack(side=tk.LEFT)
+            to_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 23:59:59"))
+            ttk.Entry(top, textvariable=to_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Button(top, text="Buscar / Actualizar", command=lambda: load_list()).pack(side=tk.LEFT, padx=8)
+            ttk.Button(top, text="Exportar CSV", command=lambda: do_export()).pack(side=tk.RIGHT, padx=6)
+            # Botón nuevo pedido (reemplazar la llamada actual)
+            ttk.Button(top, text="Nuevo pedido", command=lambda: self.open_add_edit_order_dialog(load_list, None, win)).pack(fill=tk.X, pady=4)
+            
+            # Botón editar seleccionado
+            ttk.Button(top, text="Editar seleccionado", command=lambda: self.open_add_edit_order_dialog(load_list, get_selected_id(), win)).pack(fill=tk.X, pady=4)
+            
+    
+            # Listado central
+            tree = ttk.Treeview(win, columns=('customer','order_id','amount','method','note','created_at'), show='headings', height=18)
+            for c in ('customer','order_id','amount','method','note','created_at'):
+                tree.heading(c, text=c.capitalize())
+            tree.column('customer', width=220)
+            tree.column('order_id', width=80, anchor=tk.CENTER)
+            tree.column('amount', width=120, anchor=tk.E)
+            tree.column('method', width=120)
+            tree.column('note', width=200)
+            tree.column('created_at', width=160)
+            tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6,0))
+    
+            # resumen inferior
+            sumf = ttk.Frame(win, padding=8); sumf.pack(fill=tk.X)
+            payments_total_var = tk.StringVar(value="Pedidos pagados: $0")
+            sales_total_var = tk.StringVar(value="Ventas periodo: $0")
+            diff_var = tk.StringVar(value="Apoyo: $0")
+            ttk.Label(sumf, textvariable=payments_total_var, font=(None, 11, "bold")).pack(anchor=tk.W)
+            ttk.Label(sumf, textvariable=sales_total_var, font=(None, 10)).pack(anchor=tk.W, pady=(2,0))
+            ttk.Label(sumf, textvariable=diff_var, font=(None, 11, "bold")).pack(anchor=tk.W, pady=(4,0))
+
+
+
+
+            
+    
+            # helper: limpiar
+            def clear():
+                for iid in tree.get_children(): tree.delete(iid)
+    
+            def load_list():
+                clear()
+                start_dt = from_var.get().strip()
+                end_dt = to_var.get().strip()
+                if not start_dt or not end_dt:
+                    messagebox.showwarning("Fechas", "Ingresa rango válido (desde y hasta).")
+                    return
+                rows = get_order_payments_list_for_period(conn, start_dt, end_dt)
+                total_payments = 0
+                for r in rows:
+                    rr = dict(r) if hasattr(r, 'keys') else r
+                    customer = rr.get('customer_name') if isinstance(rr, dict) else rr[2]
+                    order_id = rr.get('order_id') if isinstance(rr, dict) else rr[1]
+                    amount = int(rr.get('amount') if isinstance(rr, dict) else rr[3])
+                    method = rr.get('method') if isinstance(rr, dict) else rr[4]
+                    note = rr.get('note') if isinstance(rr, dict) else rr[5]
+                    when = rr.get('created_at') if isinstance(rr, dict) else rr[6]
+                    tree.insert('', tk.END, values=(customer, order_id, f"${format_money(amount)}", method, note, when))
+                    total_payments += amount
+    
+                total_sales = get_total_sales_for_period(conn, start_dt, end_dt)
+                diff = int(total_sales) - int(total_payments)
+    
+                payments_total_var.set(f"Pedidos pagados (suma): ${format_money(total_payments)}")
+                sales_total_var.set(f"Ventas periodo: ${format_money(total_sales)}")
+                if diff < 0:
+                    diff_var.set(f"Diferencia: -${format_money(abs(diff))} (déficit)")
+                else:
+                    diff_var.set(f"Diferencia: ${format_money(diff)}")
+    
+            def do_export():
+                start_dt = from_var.get().strip(); end_dt = to_var.get().strip()
+                if not start_dt or not end_dt:
+                    messagebox.showwarning("Fechas", "Ingresa rango válido (desde y hasta).")
+                    return
+                from tkinter import filedialog
+                path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"pedidos_pagos_{datetime.now().strftime('%Y%m%d')}.csv", filetypes=[("CSV","*.csv")])
+                if not path: return
+                try:
+                    export_orders_payments_summary_csv(conn, path, start_dt, end_dt)
+                    messagebox.showinfo("Exportado", f"CSV guardado en:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo exportar:\n{e}")
+    
+            # atajos
+            win.bind("<Escape>", lambda e: win.destroy())
+            win.bind("<Return>", lambda e: load_list())
+    
+            # inicializar con hoy
+            load_list()
+            return win
+        return self.open_window_once("orders_payments_summary", creator)
+    
+
+    
+        # -----------------------
+    # Métodos para la clase POSApp
+    # -----------------------
+    
+    def open_add_edit_order_dialog(self, refresh_cb, order_id=None, parent_win=None):
+        """
+        Diálogo para crear o editar un pedido.
+        - refresh_cb: función que se llama al guardar para recargar la lista (ej: load_list)
+        - order_id: si es None crea nuevo; si es int, edita el pedido
+        - parent_win: widget padre (opcional)
+        """
+        parent = parent_win or self.root
+        ed = tk.Toplevel(parent)
+        ed.title("Editar pedido" if order_id else "Nuevo pedido")
+        ed.geometry("440x320")
+        ed.resizable(False, False)
+        try: ed.transient(parent)
+        except: pass
+        try: ed.grab_set()
+        except: pass
+        ed.lift(); ed.focus_force()
+    
+        existing = None
+        if order_id:
+            try:
+                existing = get_order(conn, order_id)
+            except Exception:
+                existing = None
+    
+        name_var = tk.StringVar(value=(existing['customer_name'] if existing else ""))
+        contact_var = tk.StringVar(value=(existing['contact'] if existing else ""))
+        desc_var = tk.StringVar(value=(existing['description'] if existing else ""))
+        total_var = tk.StringVar(value=str(existing['total_expected'] if existing else "0"))
+    
+        frm = ttk.Frame(ed, padding=12); frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm, text="Cliente:").grid(row=0, column=0, sticky=tk.W, pady=(0,6))
+        ttk.Entry(frm, textvariable=name_var, width=42).grid(row=0, column=1, pady=(0,6))
+        ttk.Label(frm, text="Contacto:").grid(row=1, column=0, sticky=tk.W, pady=(0,6))
+        ttk.Entry(frm, textvariable=contact_var, width=42).grid(row=1, column=1, pady=(0,6))
+        ttk.Label(frm, text="Descripción:").grid(row=2, column=0, sticky=tk.W, pady=(0,6))
+        ttk.Entry(frm, textvariable=desc_var, width=42).grid(row=2, column=1, pady=(0,6))
+        ttk.Label(frm, text="Total esperado:").grid(row=3, column=0, sticky=tk.W, pady=(0,6))
+        ttk.Entry(frm, textvariable=total_var, width=20).grid(row=3, column=1, sticky=tk.W, pady=(0,6))
+    
+        btnf = ttk.Frame(frm); btnf.grid(row=4, column=0, columnspan=2, pady=(12,0))
+        def on_save():
+            name = name_var.get().strip()
+            contact = contact_var.get().strip()
+            desc = desc_var.get().strip()
+            total = parse_money_to_int(total_var.get())
+            if not name:
+                messagebox.showwarning("Falta", "Ingrese el nombre del cliente.")
+                return
+            try:
+                if order_id:
+                    update_order(conn, order_id,
+                                 customer_name=name,
+                                 contact=contact,
+                                 description=desc,
+                                 total_expected=total)
+                    messagebox.showinfo("Actualizado", "Pedido actualizado correctamente.")
+                else:
+                    nid = create_order(conn, name, contact, desc, total)
+                    messagebox.showinfo("Creado", f"Pedido creado (ID: {nid})")
+                try:
+                    if callable(refresh_cb):
+                        refresh_cb()
+                except Exception:
+                    pass
+                ed.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo guardar el pedido:\n{e}")
+    
+        ttk.Button(btnf, text="Guardar (Enter)", command=on_save).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btnf, text="Cancelar (Esc)", command=ed.destroy).pack(side=tk.LEFT, padx=6)
+        ed.bind("<Return>", lambda e: on_save())
+        ed.bind("<Escape>", lambda e: ed.destroy())
+        ed.after(40, lambda: (ed.focus_force(), ed.grab_set(), ed.lift()))
+        return ed
+    
+    
+    def open_orders_window(self):
+        """
+        Ventana CRUD de pedidos y pagos. Incluye:
+         - lista de pedidos
+         - crear/editar/eliminar pedidos
+         - agregar pagos a pedidos
+         - exportar CSV pedidos y pagos
+        """
+        def creator():
+            win = tk.Toplevel(self.root)
+            win.title("Pedidos / Órdenes")
+            win.geometry("980x620")
+            try: win.grab_set()
+            except: pass
+            win.lift(); win.focus_force()
+    
+            top = ttk.Frame(win, padding=6); top.pack(fill=tk.X)
+            ttk.Label(top, text="Buscar:").pack(side=tk.LEFT)
+            qvar = tk.StringVar()
+            qentry = ttk.Entry(top, textvariable=qvar, width=30); qentry.pack(side=tk.LEFT, padx=6)
+            ttk.Label(top, text="Desde:").pack(side=tk.LEFT, padx=(12,0))
+            from_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 00:00:00"))
+            from_entry = ttk.Entry(top, textvariable=from_var, width=18); from_entry.pack(side=tk.LEFT, padx=6)
+            ttk.Label(top, text="Hasta:").pack(side=tk.LEFT)
+            to_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 23:59:59"))
+            to_entry = ttk.Entry(top, textvariable=to_var, width=18); to_entry.pack(side=tk.LEFT, padx=6)
+            ttk.Button(top, text="Buscar / Actualizar", command=lambda: load_list()).pack(side=tk.LEFT, padx=8)
+            ttk.Button(top, text="Exportar pedidos (CSV)", command=lambda: self._export_orders_csv(from_var.get(), to_var.get())).pack(side=tk.RIGHT, padx=6)
+            ttk.Button(top, text="Exportar pagos (CSV)", command=lambda: self._export_order_payments_csv(from_var.get(), to_var.get())).pack(side=tk.RIGHT)
+    
+            mid = ttk.Frame(win, padding=6); mid.pack(fill=tk.BOTH, expand=True)
+            left = ttk.Frame(mid); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,6))
+            right = ttk.Frame(mid, width=320); right.pack(side=tk.LEFT, fill=tk.Y)
+    
+            cols = ('id','customer','contact','total_expected','total_paid','status','created_at')
+            tree = ttk.Treeview(left, columns=cols, show='headings', height=20)
+            for c in cols:
+                tree.heading(c, text=c.capitalize())
+            tree.column('id', width=50, anchor=tk.CENTER)
+            tree.column('customer', width=220)
+            tree.column('total_expected', width=110, anchor=tk.E)
+            tree.column('total_paid', width=110, anchor=tk.E)
+            tree.pack(fill=tk.BOTH, expand=True)
+    
+            # función para obtener id seleccionado
+            def get_selected_id():
+                sel = tree.selection()
+                if not sel:
+                    messagebox.showwarning("Seleccionar", "Selecciona un pedido primero.")
+                    return None
+                try:
+                    vals = tree.item(sel[0], "values")
+                    return int(vals[0])
+                except Exception:
+                    messagebox.showerror("Error", "No se pudo obtener el ID del pedido.")
+                    return None
+    
+            # right side: detalle y acciones
+            ttk.Label(right, text="Detalle / Acciones", font=(None, 11, 'bold')).pack(anchor=tk.W)
+            details = tk.Text(right, height=8, wrap='word'); details.pack(fill=tk.X, pady=(6,4))
+            ttk.Label(right, text="Pagos registrados:").pack(anchor=tk.W)
+            payments_tree = ttk.Treeview(right, columns=('id','method','amount','created_at'), show='headings', height=8)
+            payments_tree.heading('method', text='Método'); payments_tree.heading('amount', text='Monto'); payments_tree.heading('created_at', text='Fecha')
+            payments_tree.column('amount', anchor=tk.E, width=100)
+            payments_tree.pack(fill=tk.X, pady=(6,4))
+    
+            af = ttk.Frame(right); af.pack(fill=tk.X, pady=(6,0))
+            ttk.Button(af, text="Nuevo pedido", command=lambda: self.open_add_edit_order_dialog(load_list, None, win)).pack(fill=tk.X, pady=4)
+            ttk.Button(af, text="Editar seleccionado", command=lambda: self.open_add_edit_order_dialog(load_list, get_selected_id(), win)).pack(fill=tk.X, pady=4)
+            ttk.Button(af, text="Eliminar pedido", command=lambda: do_delete(get_selected_id())).pack(fill=tk.X, pady=4)
+            ttk.Separator(af, orient='horizontal').pack(fill=tk.X, pady=6)
+            ttk.Button(af, text="Agregar pago", command=lambda: open_add_payment(get_selected_id())).pack(fill=tk.X, pady=4)
+            ttk.Button(af, text="Sumar pagos del día", command=lambda: show_sum_today()).pack(fill=tk.X, pady=4)
+    
+            # helpers internos
+            def format_money_local(x):
+                try:
+                    return f"{int(x):,}".replace(",", ".")
+                except:
+                    return str(x)
+    
+            def load_list():
+                for iid in tree.get_children(): tree.delete(iid)
+                q = qvar.get().strip() or None
+                start = from_var.get().strip() or None
+                end = to_var.get().strip() or None
+                rows = get_orders(conn, q=q, start=start, end=end)
+                for r in rows:
+                    rr = dict(r)
+                    tree.insert('', tk.END, values=(rr.get('id'), rr.get('customer_name'), rr.get('contact'),
+                                                   f"${format_money(rr.get('total_expected') or 0)}",
+                                                   f"${format_money(rr.get('total_paid') or 0)}",
+                                                   rr.get('status'), rr.get('created_at')))
+                details.delete('1.0', tk.END)
+                payments_tree.delete(*payments_tree.get_children())
+    
+            def do_delete(order_id):
+                if not order_id:
+                    messagebox.showinfo("Seleccionar", "Selecciona un pedido")
+                    return
+                if not messagebox.askyesno("Confirmar", "¿Eliminar pedido y sus pagos?"): return
+                delete_order(conn, order_id)
+                load_list()
+    
+            def open_add_payment(order_id):
+                if not order_id:
+                    messagebox.showinfo("Seleccionar", "Selecciona un pedido")
+                    return
+                def do_save():
+                    try:
+                        m = method_var.get()
+                        amt = parse_money_to_int(amount_var.get())
+                        note = note_var.get().strip()
+                        if amt <= 0:
+                            messagebox.showwarning("Monto", "Ingresa monto válido"); return
+                        add_order_payment(conn, order_id, m, amt, note)
+                        messagebox.showinfo("Registrado", "Pago agregado")
+                        ap.destroy(); load_list(); load_payments(order_id)
+                    except Exception as e:
+                        messagebox.showerror("Error", str(e))
+                ap = tk.Toplevel(win); ap.title("Agregar pago"); ap.geometry("380x200")
+                ttk.Label(ap, text="Método:").pack(anchor=tk.W, padx=8, pady=(8,0))
+                method_var = tk.StringVar(value="Efectivo")
+                ttk.Combobox(ap, textvariable=method_var, values=["Efectivo","Transferencia","Otro"], state='readonly').pack(fill=tk.X, padx=8)
+                ttk.Label(ap, text="Monto:").pack(anchor=tk.W, padx=8, pady=(8,0))
+                amount_var = tk.StringVar(value="0")
+                ttk.Entry(ap, textvariable=amount_var).pack(fill=tk.X, padx=8)
+                ttk.Label(ap, text="Nota (opcional):").pack(anchor=tk.W, padx=8, pady=(8,0))
+                note_var = tk.StringVar()
+                ttk.Entry(ap, textvariable=note_var).pack(fill=tk.X, padx=8)
+                btnf = ttk.Frame(ap); btnf.pack(pady=10)
+                ttk.Button(btnf, text="Guardar (Enter)", command=do_save).pack(side=tk.LEFT, padx=6)
+                ttk.Button(btnf, text="Cancelar", command=ap.destroy).pack(side=tk.LEFT, padx=6)
+                ap.bind("<Return>", lambda e: do_save()); ap.bind("<Escape>", lambda e: ap.destroy())
+                ap.grab_set(); ap.focus_force()
+    
+            def load_payments(order_id):
+                payments_tree.delete(*payments_tree.get_children())
+                if not order_id: return
+                rows = get_order_payments(conn, order_id)
+                for r in rows:
+                    rr = dict(r)
+                    payments_tree.insert('', tk.END, values=(rr.get('id'), rr.get('method'), f"${format_money(rr.get('amount'))}", rr.get('created_at')))
+    
+            def show_detail():
+                sel = tree.selection()
+                if not sel:
+                    details.delete('1.0', tk.END); payments_tree.delete(*payments_tree.get_children()); return
+                oid = int(tree.item(sel[0], 'values')[0])
+                row = get_order(conn, oid)
+                details.delete('1.0', tk.END)
+                if row:
+                    rr = dict(row)
+                    details.insert(tk.END, f"Cliente: {rr.get('customer_name')}\nContacto: {rr.get('contact')}\nDescripcion: {rr.get('description')}\nTotal esperado: ${format_money(rr.get('total_expected') or 0)}\nTotal pagado: ${format_money(rr.get('total_paid') or 0)}\nEstado: {rr.get('status')}\nCreado: {rr.get('created_at')}")
+                load_payments(oid)
+    
+            def show_sum_today():
+                today = datetime.now().strftime("%Y-%m-%d")
+                total = sum_order_payments_for_date(conn, today)
+                messagebox.showinfo("Total pagos hoy", f"Total recibido hoy por pedidos: ${format_money(total)}")
+    
+            # bindings
+            tree.bind('<<TreeviewSelect>>', lambda e: show_detail())
+            tree.bind('<Double-1>', lambda e: self.open_add_edit_order_dialog(load_list, get_selected_id(), win))
+            load_list()
+            return win
+    
+        return self.open_window_once("orders", creator)
+    
+
+
+
+
+
+    def open_paid_orders_window(self):
+        """
+        Ventana sencilla: listar pedidos pagados (periodo), agregar, eliminar, sumar y comparar con ventas, exportar CSV.
+        """
+        def creator():
+            win = tk.Toplevel(self.root)
+            win.title("Pedidos pagados — Resumen")
+            win.geometry("760x520")
+            try: win.grab_set()
+            except: pass
+            win.lift(); win.focus_force()
+    
+            top = ttk.Frame(win, padding=8); top.pack(fill=tk.X)
+            ttk.Label(top, text="Desde (YYYY-MM-DD HH:MM:SS):").pack(side=tk.LEFT)
+            from_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 00:00:00"))
+            ttk.Entry(top, textvariable=from_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Label(top, text="Hasta:").pack(side=tk.LEFT)
+            to_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 23:59:59"))
+            ttk.Entry(top, textvariable=to_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Button(top, text="Actualizar", command=lambda: load_list()).pack(side=tk.LEFT, padx=8)
+            ttk.Button(top, text="Exportar CSV", command=lambda: do_export()).pack(side=tk.RIGHT, padx=6)
+    
+            # tree
+            cols = ('id','customer','amount','note','created')
+            tree = ttk.Treeview(win, columns=cols, show='headings', height=16)
+            tree.heading('id', text='ID'); tree.heading('customer', text='Cliente'); tree.heading('amount', text='Monto'); tree.heading('note', text='Nota'); tree.heading('created', text='Fecha')
+            tree.column('id', width=40, anchor=tk.CENTER); tree.column('amount', width=120, anchor=tk.E); tree.column('customer', width=260)
+            tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8,0))
+    
+            # bottom summary and actions
+            sumf = ttk.Frame(win, padding=8); sumf.pack(fill=tk.X)
+            paid_total_var = tk.StringVar(value="Pedidos pagados: $0")
+            sales_total_var = tk.StringVar(value="Ventas periodo: $0")
+            diff_var = tk.StringVar(value="Diferencia: $0")
+            ttk.Label(sumf, textvariable=paid_total_var, font=(None,11,"bold")).pack(anchor=tk.W)
+            ttk.Label(sumf, textvariable=sales_total_var).pack(anchor=tk.W, pady=(2,0))
+            ttk.Label(sumf, textvariable=diff_var, font=(None,10,"bold")).pack(anchor=tk.W, pady=(6,0))
+    
+            btnf = ttk.Frame(win, padding=6); btnf.pack(fill=tk.X)
+            ttk.Button(btnf, text="Agregar pedido pagado", command=lambda: open_add_dialog()).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Eliminar seleccionado", command=lambda: do_delete_selected()).pack(side=tk.LEFT)
+            ttk.Button(btnf, text="Cerrar (Esc)", command=win.destroy).pack(side=tk.RIGHT)
+    
+            # helpers
+            def clear():
+                for i in tree.get_children(): tree.delete(i)
+    
+            def load_list():
+                clear()
+                start = from_var.get().strip(); end = to_var.get().strip()
+                if not start or not end:
+                    messagebox.showwarning("Fechas", "Ingrese un rango válido (desde/hasta).")
+                    return
+                rows = get_paid_orders_for_period(conn, start, end)
+                total_payments = 0
+                for r in rows:
+                    rr = dict(r) if hasattr(r, 'keys') else r
+                    if isinstance(rr, dict):
+                        amt = int(rr.get('amount') or 0)
+                        tree.insert('', tk.END, values=(rr.get('id'), rr.get('customer_name'), f"${format_money(amt)}", rr.get('note'), rr.get('created_at')))
+                        total_payments += amt
+                    else:
+                        amt = int(rr[2] or 0)
+                        tree.insert('', tk.END, values=(rr[0], rr[1], f"${format_money(amt)}", rr[3], rr[4]))
+                        total_payments += amt
+                # totals and comparison
+                total_sales = get_total_sales_for_period(conn, start, end)
+                paid_total_var.set(f"Pedidos pagados (suma): ${format_money(total_payments)}")
+                sales_total_var.set(f"Ventas periodo: ${format_money(total_sales)}")
+                diff = int(total_sales) - int(total_payments)
+                if diff < 0:
+                    diff_var.set(f"Diferencia: -${format_money(abs(diff))} (déficit)")
+                else:
+                    diff_var.set(f"Diferencia: ${format_money(diff)}")
+    
+            def open_add_dialog():
+                d = tk.Toplevel(win); d.title("Agregar pedido pagado"); d.geometry("420x220")
+                ttk.Label(d, text="Cliente:").pack(anchor=tk.W, padx=8, pady=(8,0))
+                name_var = tk.StringVar(); ttk.Entry(d, textvariable=name_var).pack(fill=tk.X, padx=8)
+                ttk.Label(d, text="Monto:").pack(anchor=tk.W, padx=8, pady=(8,0))
+                amt_var = tk.StringVar(value="0"); ttk.Entry(d, textvariable=amt_var).pack(fill=tk.X, padx=8)
+                ttk.Label(d, text="Nota (opcional):").pack(anchor=tk.W, padx=8, pady=(8,0))
+                note_var = tk.StringVar(); ttk.Entry(d, textvariable=note_var).pack(fill=tk.X, padx=8)
+                bf = ttk.Frame(d); bf.pack(pady=10)
+                def save():
+                    name = name_var.get().strip()
+                    amt = parse_money_to_int(amt_var.get())
+                    note = note_var.get().strip()
+                    if not name or amt <= 0:
+                        messagebox.showwarning("Datos", "Nombre y monto válido son requeridos."); return
+                    add_paid_order(conn, name, amt, note)
+                    d.destroy(); load_list()
+                ttk.Button(bf, text="Guardar", command=save).pack(side=tk.LEFT, padx=6)
+                ttk.Button(bf, text="Cancelar", command=d.destroy).pack(side=tk.LEFT, padx=6)
+                d.bind("<Return>", lambda e: save()); d.bind("<Escape>", lambda e: d.destroy())
+                d.grab_set(); d.focus_force()
+    
+            def do_delete_selected():
+                sel = tree.selection()
+                if not sel:
+                    messagebox.showinfo("Seleccionar","Selecciona un pedido")
+                    return
+                oid = int(tree.item(sel[0], 'values')[0])
+                if not messagebox.askyesno("Confirmar","Eliminar pedido seleccionado?"): return
+                delete_paid_order(conn, oid)
+                load_list()
+    
+            def do_export():
+                start = from_var.get().strip(); end = to_var.get().strip()
+                if not start or not end:
+                    messagebox.showwarning("Fechas","Ingresa rango válido")
+                    return
+                from tkinter import filedialog
+                path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"paid_orders_{datetime.now().strftime('%Y%m%d')}.csv", filetypes=[("CSV","*.csv")])
+                if not path: return
+                try:
+                    export_paid_orders_csv(conn, path, start, end)
+                    messagebox.showinfo("Exportado", f"CSV guardado en:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("Error", str(e))
+    
+            win.bind("<Escape>", lambda e: win.destroy())
+            load_list()
+            return win
+    
+        # si tienes open_window_once en tu clase (evitar duplicados) úsalo, si no solo crea la ventana
+        if hasattr(self, 'open_window_once'):
+            return self.open_window_once("paid_orders", creator)
+        else:
+            return creator()
+    
 
 
     def open_suppliers_window(self):
@@ -2356,7 +3690,8 @@ class POSApp:
             win.bind('<Escape>', lambda e: win.destroy())
             return win
         
-            return self.open_window_once(f'edit_prod_{product_id}', creator)
+        return self.open_window_once(f'edit_prod_{product_id}', creator)
+    
     def reload_category_buttons(self):
         # Limpiar frame
         for w in self.cat_frame.winfo_children():
@@ -2373,13 +3708,9 @@ class POSApp:
                 break  # sólo manejamos hasta 10 botones por ahora
             key = keys[i]
             btn_text = f"{key} - {name}"
-            btn = ttk.Button(
-                self.cat_frame,
-                text=btn_text,
-                width=22,
-                command=lambda c=cid, n=name: self.open_search_for_category(c, n)
-            )
-            btn.pack(pady=3)
+            btn = ttk.Button(self.cat_frame,text=btn_text, width=22, command=lambda c=cid, n=name: self.open_search_for_category(c, n))
+            btn.pack(pady=3, ipady=6)
+            # .pack(side="bottom", fill=tk.X, pady=3, ipadx=15, ipady=20)
             # guardar el atajo
             self.category_hotkeys[key] = (cid, name)
     
@@ -2546,58 +3877,210 @@ class POSApp:
 
     # ---------- manage categories window ----------
     def manage_categories_window(self):
-        def creator():
-            win = tk.Toplevel(self.root)
-            win.title('Administrar categorías')
-            win.geometry('420x420')
-            listbox = tk.Listbox(win, width=50, height=12)
-            listbox.pack(pady=8)
-
-            def refresh():
-                listbox.delete(0, tk.END)
-                for cid, name in get_categories():
-                    listbox.insert(tk.END, f"{cid} - {name}")
-            refresh()
-
-            name_var = tk.StringVar()
-            ttk.Label(win, text='Nombre:').pack()
-            entry = ttk.Entry(win, textvariable=name_var)
-            entry.pack(pady=6)
-            entry.bind('<Return>', lambda e: add())
-
-            def add():
-                name = name_var.get().strip()
-                if not name:
-                    messagebox.showwarning('Aviso', 'Escribe un nombre')
-                    return
-                ok = add_category(name)
-                if not ok:
-                    messagebox.showerror('Error', 'Esa categoría ya existe')
-                name_var.set('')
-                refresh()
-                self.reload_category_buttons()
-
-            def delete():
-                sel = listbox.curselection()
-                if not sel:
-                    messagebox.showwarning('Aviso', 'Selecciona una categoría')
-                    return
-                text = listbox.get(sel[0])
-                cid = int(text.split(' - ')[0])
-                if messagebox.askyesno('Confirmar', 'Eliminar categoría? (No borra productos)'):
-                    delete_category(cid)
-                    refresh()
-                    self.reload_category_buttons()
-
-            ttk.Button(win, text='Agregar', command=add).pack(pady=4)
-            ttk.Button(win, text='Eliminar', command=delete).pack(pady=4)
-            ttk.Button(win, text='Cerrar (Esc)', command=win.destroy).pack(pady=6)
-            
-            win.bind('<Escape>', lambda e: win.destroy())
-            
-            return win
-        return self.open_window_once('manage_categories', creator)
-
+       def creator():
+           win = tk.Toplevel(self.root)
+           win.title('Administrar categorías')
+           win.geometry('460x440')
+           win.resizable(False, False)
+           try: win.grab_set()
+           except: pass
+           win.transient(self.root)
+           win.lift(); win.focus_force()
+   
+           # Listbox con scrollbar
+           frame_list = ttk.Frame(win, padding=8)
+           frame_list.pack(fill=tk.BOTH, expand=False)
+           scrollbar = ttk.Scrollbar(frame_list, orient=tk.VERTICAL)
+           listbox = tk.Listbox(frame_list, width=50, height=12, yscrollcommand=scrollbar.set)
+           scrollbar.config(command=listbox.yview)
+           listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+           scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+   
+           # Load / refresh
+           def refresh():
+               listbox.delete(0, tk.END)
+               try:
+                   cats = get_categories()
+               except Exception:
+                   # si get_categories espera conn: intentar con conn global o self.conn
+                   try:
+                       cats = get_categories(conn)
+                   except:
+                       try:
+                           cats = get_categories(self.conn)
+                       except:
+                           cats = []
+               # cats puede venir como [(id,name),...] o list of dicts
+               for c in cats:
+                   try:
+                       if isinstance(c, dict):
+                           cid = c.get('id'); name = c.get('name')
+                       else:
+                           # tupla/row
+                           cid = c[0]; name = c[1]
+                       listbox.insert(tk.END, f"{cid} - {name}")
+                   except Exception:
+                       # forma fallback
+                       listbox.insert(tk.END, str(c))
+   
+           refresh()
+   
+           # Formulario de edición/creación
+           form = ttk.Frame(win, padding=(8,6))
+           form.pack(fill=tk.X)
+           ttk.Label(form, text='Nombre:').grid(row=0, column=0, sticky=tk.W)
+           name_var = tk.StringVar()
+           entry = ttk.Entry(form, textvariable=name_var, width=36)
+           entry.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+           entry.bind('<Return>', lambda e: add_or_update())
+   
+           ttk.Label(form, text='Color (opcional hex):').grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+           color_var = tk.StringVar(value="")
+           color_entry = ttk.Entry(form, textvariable=color_var, width=16)
+           color_entry.grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
+   
+           # Estado: si hay selección estamos en modo editar
+           editing_id = {'id': None}
+   
+           def select_current():
+               sel = listbox.curselection()
+               if not sel:
+                   editing_id['id'] = None
+                   name_var.set('')
+                   color_var.set('')
+                   return
+               text = listbox.get(sel[0])
+               try:
+                   cid = int(text.split(' - ')[0])
+               except:
+                   # fallback: intentar encontrar en get_categories
+                   try:
+                       cats = get_categories()
+                   except:
+                       try: cats = get_categories(conn)
+                       except:
+                           try: cats = get_categories(self.conn)
+                           except: cats = []
+                   cid = None
+                   for c in cats:
+                       if isinstance(c, dict) and c.get('name') in text:
+                           cid = c.get('id'); break
+                       elif isinstance(c, (list,tuple)) and str(c[1]) in text:
+                           cid = c[0]; break
+               if cid is None:
+                   editing_id['id'] = None
+                   return
+               editing_id['id'] = cid
+               # obtener nombre y color del helper
+               try:
+                   cats = get_categories()
+               except:
+                   try: cats = get_categories(conn)
+                   except:
+                       try: cats = get_categories(self.conn)
+                       except: cats = []
+               for c in cats:
+                   try:
+                       if (isinstance(c, dict) and c.get('id') == cid) or (not isinstance(c, dict) and c[0] == cid):
+                           name = c.get('name') if isinstance(c, dict) else c[1]
+                           color = c.get('color') if isinstance(c, dict) else (c[2] if len(c)>2 else "")
+                           name_var.set(name or "")
+                           color_var.set(color or "")
+                           break
+                   except:
+                       pass
+   
+           # Add or update depending on selection
+           def add_or_update():
+               name = name_var.get().strip()
+               color = color_var.get().strip() or None
+               if not name:
+                   messagebox.showwarning('Aviso', 'Escribe un nombre')
+                   return
+               cid = editing_id.get('id')
+               if cid:
+                   # UPDATE
+                   try:
+                       # prefer helper update_category
+                       if 'update_category' in globals():
+                           if color is not None:
+                               update_category(conn if 'conn' in globals() else self.conn, cid, name=name, color=color, sort_order=None)
+                           else:
+                               update_category(conn if 'conn' in globals() else self.conn, cid, name=name)
+                       else:
+                           # fallback SQL
+                           cur = (conn if 'conn' in globals() else self.conn).cursor()
+                           if color is not None:
+                               cur.execute("UPDATE categories SET name=?, color=? WHERE id=?", (name, color, cid))
+                           else:
+                               cur.execute("UPDATE categories SET name=? WHERE id=?", (name, cid))
+                           (conn if 'conn' in globals() else self.conn).commit()
+                       messagebox.showinfo('Editado', 'Categoría actualizada')
+                   except Exception as e:
+                       messagebox.showerror('Error', f'No se pudo actualizar: {e}')
+               else:
+                   # INSERT
+                   try:
+                       if 'add_category' in globals():
+                           add_category(name)
+                       else:
+                           cur = (conn if 'conn' in globals() else self.conn).cursor()
+                           cur.execute("INSERT INTO categories (name) VALUES (?)", (name,))
+                           (conn if 'conn' in globals() else self.conn).commit()
+                       messagebox.showinfo('Creada', 'Categoría creada')
+                   except Exception as e:
+                       messagebox.showerror('Error', f'No se pudo crear categoría: {e}')
+               # limpiar y refrescar
+               name_var.set(''); color_var.set(''); editing_id['id'] = None
+               refresh()
+               try: self.reload_category_buttons()
+               except: pass
+   
+           def delete():
+               sel = listbox.curselection()
+               if not sel:
+                   messagebox.showwarning('Aviso', 'Selecciona una categoría')
+                   return
+               text = listbox.get(sel[0])
+               try:
+                   cid = int(text.split(' - ')[0])
+               except:
+                   messagebox.showerror('Error', 'Formato de entrada inesperado'); return
+               if messagebox.askyesno('Confirmar', 'Eliminar categoría? (No borra productos)'):
+                   try:
+                       if 'delete_category' in globals():
+                           delete_category(cid)
+                       else:
+                           cur = (conn if 'conn' in globals() else self.conn).cursor()
+                           cur.execute("DELETE FROM categories WHERE id=?", (cid,))
+                           (conn if 'conn' in globals() else self.conn).commit()
+                       messagebox.showinfo('Eliminada', 'Categoría eliminada')
+                   except Exception as e:
+                       messagebox.showerror('Error', f'No se pudo eliminar: {e}')
+                   # limpiar y refrescar
+                   name_var.set(''); color_var.set(''); editing_id['id'] = None
+                   refresh()
+                   try: self.reload_category_buttons()
+                   except: pass
+   
+           # Botones
+           btnf = ttk.Frame(win, padding=(8,6))
+           btnf.pack(fill=tk.X)
+           ttk.Button(btnf, text='Nuevo', command=lambda: (editing_id.update({'id': None}), name_var.set(''), color_var.set(''))).pack(side=tk.LEFT, padx=6)
+           ttk.Button(btnf, text='Guardar / Renombrar', command=add_or_update).pack(side=tk.LEFT, padx=6)
+           ttk.Button(btnf, text='Eliminar', command=delete).pack(side=tk.LEFT, padx=6)
+           ttk.Button(btnf, text='Cerrar (Esc)', command=win.destroy).pack(side=tk.RIGHT, padx=6)
+   
+           # Bindings
+           listbox.bind('<<ListboxSelect>>', lambda e: select_current())
+           listbox.bind('<Double-Button-1>', lambda e: select_current())
+           win.bind('<Escape>', lambda e: win.destroy())
+   
+           # focus
+           entry.focus_set()
+           return win
+       return self.open_window_once('manage_categories', creator)
+   
     # ---------- add product window ----------
     def open_add_product_window(self):
         def creator():
@@ -2797,6 +4280,11 @@ class POSApp:
         ttk.Label(sumf, textvariable=total_out_var, font=(None, 10)).pack(anchor=tk.W, pady=(2,0))
         ttk.Label(sumf, textvariable=net_total_var, font=(None, 11, "bold")).pack(anchor=tk.W, pady=(2,6))
     
+        # sumf = ttk.Frame(win, padding=8); sumf.pack(fill=tk.X)
+        # total_out_var = tk.StringVar(value="Salidas: $0")
+        # ttk.Label(sumf, textvariable=total_out_var, font=(None, 10)).pack(anchor=tk.W, pady=(2,0))
+        # btns_frame = ttk.Frame(sumf)
+
         # botón para registrar salida
         btns_frame = ttk.Frame(sumf)
         btns_frame.pack(fill=tk.X, pady=(4,0))
@@ -2880,7 +4368,9 @@ class POSApp:
             # update summary
             cnt = tot_row["cnt"] if tot_row else 0
             total_amt = tot_row["total_amount"] if tot_row else 0
-            total_sales_var.set(f"Ventas: {cnt}   |   Total: ${format_money(total_amt)}")
+            total_sales_var.set(f"Ventas: {cnt}")
+            total_sales_var.set(f"Total: ${format_money(total_amt)}")
+            
             total_out_var.set(f"Salidas: ${format_money(total_out)}")
             net_total_var.set(f"Neto: ${format_money(net_total)}")
             
@@ -3349,275 +4839,617 @@ class POSApp:
         if messagebox.askyesno('Confirmar', 'Vaciar carrito?'):
             self.cart.clear()
             self.refresh_cart()
-
-
-
-
-
-
-
-
-
-
-    def checkoutxxx(self):
+    
+    
+    
+    def open_payment_dialog_and_finalize(self, cart_total, sale_id=None):
         """
-        Abre la ventana de pago donde se ingresa el monto recibido y se calcula la devolución.
-        Usa open_window_once('payment', creator) para asegurar una sola instancia.
+        Abre un diálogo para cobrar la venta.
+        - cart_total: total en enteros (p: 100000) o string con formato; se normaliza con parse_money_to_int.
+        - sale_id: si ya creaste el registro de venta y tienes su id, pásalo para asociar el pago.
         """
-        if not self.cart:
-            messagebox.showinfo('Carrito vacío', 'No hay items para cobrar.')
-            return
+        # normalizar total
+        try:
+            total = parse_money_to_int(cart_total) if not isinstance(cart_total, (int,float)) else int(cart_total)
+        except Exception:
+            # si no tienes parse_money_to_int, intenta quitar símbolos y convertir
+            s = str(cart_total).replace("$","").replace(",","").strip()
+            total = int(float(s))
     
-        # calcular total
-        total = sum(item.total() for item in self.cart.values())
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Finalizar venta - Cobro")
+        dlg.geometry("420x220")
+        try: dlg.grab_set()
+        except: pass
+        dlg.transient(self.root)
+        dlg.lift(); dlg.focus_force()
     
-        def creator():
-            win = tk.Toplevel(self.root)
-            win.title("Caja - Pago")
-            win.geometry("360x220")
-            win.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=10); frm.pack(fill=tk.BOTH, expand=True)
     
-            ttk.Label(win, text="PAGAR", font=(None, 14, 'bold')).pack(pady=(10,6))
+        ttk.Label(frm, text=f"Total a cobrar: ${format_money(total)}", font=(None,12,"bold")).pack(anchor=tk.W, pady=(0,8))
     
-            frame = ttk.Frame(win, padding=8)
-            frame.pack(fill=tk.BOTH, expand=True)
+        # monto a cobrar (por defecto el total, permite editar para pagos parciales)
+        ttk.Label(frm, text="Monto a recibir:").pack(anchor=tk.W)
+        amount_var = tk.StringVar(value=str(total))
+        amount_entry = ttk.Entry(frm, textvariable=amount_var, justify=tk.RIGHT, width=16, font=(None,11))
+        amount_entry.pack(anchor=tk.W, pady=(0,6))
     
-            ttk.Label(frame, text=f"Total a pagar:").grid(row=0, column=0, sticky=tk.W)
-            total_var = tk.StringVar(value=f"{int(total):,}".replace(",", "."))
-
-            ttk.Label(frame, textvariable=total_var, font=(None, 12, 'bold')).grid(row=0, column=1, sticky=tk.E)
+        # Métodos de pago: efectivo (default), transferencia, tarjeta
+        ttk.Label(frm, text="Método de pago:").pack(anchor=tk.W, pady=(6,0))
+        method_var = tk.StringVar(value="Efectivo")
+        methods = [("Efectivo","Efectivo"), ("Transferencia","Transferencia"), ("Tarjeta","Tarjeta")]
+        rb_frame = ttk.Frame(frm); rb_frame.pack(anchor=tk.W, pady=(2,6))
+        for text, val in methods:
+            ttk.Radiobutton(rb_frame, text=text, value=val, variable=method_var).pack(side=tk.LEFT, padx=(0,8))
     
-            ttk.Label(frame, text="Recibido:").grid(row=1, column=0, sticky=tk.W, pady=(8,0))
-            received_var = tk.StringVar(value=f"{int(total):,}".replace(",", "."))
-            # por defecto igual al total
-            received_entry = ttk.Entry(frame, textvariable=received_var)
-            received_entry.grid(row=1, column=1, sticky=tk.EW, pady=(8,0))
-            received_entry.focus()
+        # Mensaje de ayuda
+        help_lbl = ttk.Label(frm, text="Presiona ENTER para cobrar rápido (por defecto Efectivo).", foreground="#333")
+        help_lbl.pack(anchor=tk.W, pady=(6,4))
     
-            ttk.Label(frame, text="Devolución:").grid(row=2, column=0, sticky=tk.W, pady=(8,0))
-            change_var = tk.StringVar(value="0.00")
-            ttk.Label(frame, textvariable=change_var, font=(None, 11, 'bold')).grid(row=2, column=1, sticky=tk.E, pady=(8,0))
-    
-            # Mensaje de error debajo
-            msg_var = tk.StringVar(value="")
-            msg_lbl = ttk.Label(frame, textvariable=msg_var, foreground="red")
-            msg_lbl.grid(row=3, column=0, columnspan=2, pady=(6,0))
-    
-            # Ajustes de grid
-            frame.columnconfigure(1, weight=1)
-    
-            def compute_change(*_):
+        # Función que procesa el pago y guarda en DB
+        def process_and_close(event=None):
+            # leer monto y método
+            try:
+                amt = parse_money_to_int(amount_var.get()) if not isinstance(amount_var.get(), (int,float)) else int(amount_var.get())
+            except Exception:
+                # limpiar y convertir
+                s = str(amount_var.get()).replace("$","").replace(",","").strip()
                 try:
-                    rec = float(received_var.get())
+                    amt = int(float(s))
                 except:
-                    change_var.set("—")
-                    msg_var.set("Recibido inválido")
-                    return
-                change = rec - total
-                change_var.set(f"{int(change):,}".replace(",", "."))
-
-                if rec < total:
-                    msg_var.set("Monto insuficiente")
+                    messagebox.showerror("Monto inválido", "Ingresa un monto válido."); return
+    
+            method = method_var.get() or "Efectivo"
+    
+            # validar monto mínimo
+            if amt <= 0:
+                messagebox.showwarning("Monto", "El monto debe ser mayor a cero."); return
+    
+            cur = conn.cursor()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+            try:
+                # Si no existe sale_id, crea la venta básica (adaptar campos según tu tabla 'sales')
+                if not sale_id:
+                    # Ajusta los campos INSERT según tu esquema de 'sales'
+                    cur.execute("""
+                        INSERT INTO sales (total_amount, status, created_at)
+                        VALUES (?, ?, ?)
+                    """, (total, 'open', now))
+                    sale_id_local = cur.lastrowid
                 else:
-                    msg_var.set("")
+                    sale_id_local = sale_id
+    
+                # Insertar registro del pago en tabla sale_payments (ajusta nombres si es distinto)
+                cur.execute("""
+                    INSERT INTO sale_payments (sale_id, method, amount, created_at)
+                    VALUES (?, ?, ?, ?)
+                """, (sale_id_local, method, amt, now))
+    
+                # calcular pagos totales ya registrados para la venta
+                cur.execute("SELECT IFNULL(SUM(amount), 0) as paid_total FROM sale_payments WHERE sale_id = ?", (sale_id_local,))
+                paid = cur.fetchone()
+                paid_total = paid['paid_total'] if isinstance(paid, dict) and 'paid_total' in paid else (paid[0] if paid else 0)
+    
+                # Si la suma de pagos >= total, marcar venta como 'paid' (o 'closed')
+                if paid_total >= total:
+                    cur.execute("UPDATE sales SET status = ?, paid_at = ? WHERE id = ?", ('paid', now, sale_id_local))
+    
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                messagebox.showerror("Error", f"No se pudo registrar el pago: {e}")
                 return
     
-            # trace para cambio en tiempo real
-            received_var.trace_add('write', lambda *a: compute_change())
+            # Actualizar UI local: refrescar carrito, totals, etc. (llama a tus funciones)
+            try:
+                # Ejemplos de posibles funciones que tengas: refresh_sales_list, clear_cart, update_totals
+                if hasattr(self, 'refresh_sales_list'): self.refresh_sales_list()
+                if hasattr(self, 'clear_cart'): self.clear_cart()
+                if hasattr(self, 'update_totals'): self.update_totals()
+            except:
+                pass
     
-            def finalize_payment(_ev=None):
-                
-                                # validar
-                try:
-                    rec = float(received_var.get())
-                except:
-                    messagebox.showwarning("Error", "Monto recibido inválido.")
-                    return
-                if rec < total:
-                    messagebox.showwarning("Error", f"Monto insuficiente. Total: ${int(total):,}".replace(",", "."))
+            messagebox.showinfo("Cobro", f"Pago registrado.\nMétodo: {method}\nMonto: ${format_money(amt)}")
+            dlg.destroy()
+    
+        # Bind ENTER on the dialog and on the amount_entry to process quickly
+        dlg.bind("<Return>", process_and_close)
+        amount_entry.bind("<Return>", process_and_close)
+    
+        # Botones
+        btns = ttk.Frame(frm); btns.pack(fill=tk.X, pady=(8,0))
+        ttk.Button(btns, text="Cobrar (ENTER)", command=process_and_close).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(btns, text="Cancelar", command=dlg.destroy).pack(side=tk.LEFT, padx=(6,0), fill=tk.X, expand=True)
+    
+        # focus
+        amount_entry.focus_set()
 
+
+
+
+    def open_cash_closure_window(self):
+        def creator():
+            win = tk.Toplevel(self.root)
+            win.title("Cierre de caja")
+            win.geometry("1200x680")
+            try: win.grab_set()
+            except: pass
+            win.lift(); win.focus_force()
+    
+            top = ttk.Frame(win, padding=8); top.pack(fill=tk.X)
+            ttk.Label(top, text="Desde (YYYY-MM-DD HH:MM:SS):").pack(side=tk.LEFT)
+            from_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 00:00:00"))
+            ttk.Entry(top, textvariable=from_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Label(top, text="Hasta:").pack(side=tk.LEFT)
+            to_var = tk.StringVar(value=(datetime.now().strftime("%Y-%m-%d") + " 23:59:59"))
+            ttk.Entry(top, textvariable=to_var, width=20).pack(side=tk.LEFT, padx=6)
+            ttk.Button(top, text="Calcular resumen", command=lambda: do_calculate()).pack(side=tk.LEFT, padx=8)
+            ttk.Button(top, text="Exportar CSV", command=lambda: do_export_csv()).pack(side=tk.RIGHT, padx=6)
+    
+            middle = ttk.Frame(win, padding=8); middle.pack(fill=tk.BOTH, expand=True)
+            left = ttk.Frame(middle); left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,6))
+            right = ttk.Frame(middle, width=260); right.pack(side=tk.LEFT, fill=tk.Y)
+    
+            # LEFT: listas detalladas
+            ttk.Label(left, text="PEDIDOS PAGOS", font=(None,11,"bold")).pack(anchor=tk.W)
+            paid_frame = ttk.Frame(left); paid_frame.pack(fill=tk.BOTH, expand=True, pady=(4,8))
+            paid_tree = ttk.Treeview(paid_frame, columns=('id','customer','amount','note','created'), show='headings', height=7)
+            for c,name in [('id','ID'),('customer','Cliente'),('amount','Monto'),('note','Nota'),('created','Fecha')]:
+                paid_tree.heading(c, text=name)
+
+            paid_tree.column('id', width=5, anchor=tk.CENTER)
+            paid_tree.column('customer', width=5)
+            paid_tree.column('amount', width=5, anchor=tk.E)
+            paid_tree.column('note', width=5, anchor=tk.CENTER)
+            paid_tree.column('created', width=5, anchor=tk.CENTER)
+       
+            paid_tree.pack(fill=tk.BOTH, expand=True)
+    
+            ttk.Label(left, text="GASTOS", font=(None,11,"bold")).pack(anchor=tk.W, pady=(8,0))
+            adj_frame = ttk.Frame(left); adj_frame.pack(fill=tk.BOTH, expand=True, pady=(4,8))
+
+            adj_tree = ttk.Treeview(adj_frame, columns=('id','kind','note','amount','user','created'), show='headings', height=7)
+            for c,name in [('id','ID'),('kind','Tipo'),('note','Nota'),('amount','Monto'),('user','Usuario'),('created','Fecha')]:
+                adj_tree.heading(c, text=name
+                                 )
+            adj_tree.column('id', width=5, anchor=tk.CENTER)
+            adj_tree.column('kind', width=5)
+            adj_tree.column('note', width=5, anchor=tk.CENTER)
+            adj_tree.column('amount', width=5, anchor=tk.E)
+            adj_tree.column('user', width=5, anchor=tk.CENTER)
+            adj_tree.column('created', width=5, anchor=tk.CENTER)
+            adj_tree.pack(fill=tk.BOTH, expand=True)
+    
+            # RIGHT: resumen y controles
+            summary_box = ttk.LabelFrame(right, text="Resumen", padding=10); summary_box.pack(fill=tk.BOTH, padx=4, pady=4, expand=False)
+    
+            total_sales_var = tk.StringVar(value="$0")
+            cash_in_var = tk.StringVar(value="$0")
+            transfer_in_var = tk.StringVar(value="$0")
+            paid_orders_var = tk.StringVar(value="$0")
+            expenses_var = tk.StringVar(value="$0")
+            credits_var = tk.StringVar(value="$0")
+            debts_var = tk.StringVar(value="$0")
+            net_cash_var = tk.StringVar(value="$0")
+            cash_left_var = tk.StringVar(value="$0")      # efectivo que queda en caja
+            transfer_left_var = tk.StringVar(value="$0")  # total en transferencias
+    
+            ttk.Label(summary_box, text="Total ventas:").grid(row=0, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=total_sales_var).grid(row=0, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Efectivo en ventas:").grid(row=1, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=cash_in_var).grid(row=1, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Transferencias:").grid(row=2, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=transfer_in_var).grid(row=2, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Pedidos pagados:").grid(row=3, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=paid_orders_var).grid(row=3, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Gastos (salidas):").grid(row=4, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=expenses_var).grid(row=4, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Créditos (nos deben):").grid(row=5, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=credits_var).grid(row=5, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Deudas (debemos):").grid(row=6, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=debts_var).grid(row=6, column=1, sticky=tk.E)
+
+            ttk.Label(summary_box, text="Efectivo en caja (estimado):").grid(row=7, column=0, sticky=tk.W)
+            ttk.Label(summary_box, textvariable=cash_left_var).grid(row=7, column=1, sticky=tk.E)
+            # ttk.Label(summary_box, text="Transferencias (acumulado):").grid(row=8, column=0, sticky=tk.W)
+            # ttk.Label(summary_box, textvariable=transfer_left_var).grid(row=8, column=1, sticky=tk.E)
+            ttk.Label(summary_box, text="Efectivo disponible:      ",font=(None,15,"bold")).grid(row=9, column=0, sticky=tk.W, pady=(6,0))
+            ttk.Label(summary_box, textvariable=net_cash_var, font=(None,15,"bold")).grid(row=9, column=1, sticky=tk.E, pady=(6,0))
+    
+            # registrar cierre: apertura, contado y notas
+            ttk.Separator(right, orient='horizontal').pack(fill=tk.X, pady=8)
+            rc_frame = ttk.Frame(right); rc_frame.pack(fill=tk.X, pady=(4,4))
+            ttk.Label(rc_frame, text="Apertura caja:").grid(row=0, column=0, sticky=tk.W)
+            opening_var = tk.StringVar(value="0"); ttk.Entry(rc_frame, textvariable=opening_var, width=16).grid(row=0, column=1, sticky=tk.E)
+            ttk.Label(rc_frame, text="Efectivo contado:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+            counted_var = tk.StringVar(value="0"); ttk.Entry(rc_frame, textvariable=counted_var, width=16).grid(row=1, column=1, sticky=tk.E, pady=(6,0))
+            ttk.Label(rc_frame, text="Notas:").grid(row=2, column=0, sticky=tk.W, pady=(6,0))
+            notes_var = tk.StringVar(); ttk.Entry(rc_frame, textvariable=notes_var, width=22).grid(row=2, column=1, sticky=tk.E, pady=(6,0))
+    
+            btnf = ttk.Frame(right); btnf.pack(fill=tk.X, pady=(12,0))
+            ttk.Button(btnf, text="Registrar cierre", command=lambda: do_register_closure()).pack(fill=tk.X, pady=4)
+            # ejemplo: justo antes de los botones de acción (donde ya tienes Register closure)
+            ttk.Button(btnf, text="Registrar gasto", command=lambda: (self.open_outflow_dialog(), win.after(150, do_calculate))).pack(fill=tk.X, pady=4)
+            # mantén tus otros botones (Registrar cierre, Cerrar)
+            
+            ttk.Button(btnf, text="Cerrar", command=win.destroy).pack(fill=tk.X, pady=(6,0))
+    
+            # helper: cargar último cierre para proponer apertura predeterminada
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT opening_cash, cash_counted, created_at FROM cash_closures ORDER BY id DESC LIMIT 1")
+                last = cur.fetchone()
+                if last:
+                    try:
+                        last_counted = last['cash_counted'] if isinstance(last, dict) else last[1]
+                        opening_var.set(str(last_counted))
+                    except:
+                        pass
+            except:
+                pass
+    
+            def clear_views():
+                for t in (paid_tree, adj_tree):
+                    for i in t.get_children(): t.delete(i)
+
+
+            def do_calculate():
+                clear_views()
+                start_dt = from_var.get().strip(); end_dt = to_var.get().strip()
+                if not start_dt or not end_dt:
+                    messagebox.showwarning("Fechas", "Ingresa rango válido")
                     return
-    
-                # preparar items para guardar (mismo formato que save_sale espera)
-                items = []
-                for it in self.cart.values():
-                    items.append({
-                        'product_id': it.product_id,
-                        'code': it.code,
-                        'name': it.name,
-                        'price': it.price,
-                        'qty': it.qty,
-                        'category_id': it.category_id
-                    })
-    
-                # guardar venta (usa la función save_sale que tienes)
+            
+                # total ventas
+                total_sales = get_sales_total_for_period(conn, start_dt, end_dt) or 0
+                total_sales_var.set(f"${format_money(total_sales)}")
+            
+                # pagos por método (desde sale_payments)
+                pays = get_payments_summary_for_period(conn, start_dt, end_dt) or []
+                cash_total = 0; transfer_total = 0
+                payments_summary = {}
+                for p in pays:
+                    rp = dict(p) if hasattr(p, 'keys') else p
+                    method = rp.get('method') if isinstance(rp, dict) else p[0]
+                    tot = int(rp.get('total') if isinstance(rp, dict) else (p[1] or 0))
+                    payments_summary[str(method)] = payments_summary.get(str(method), 0) + tot
+                    mlow = str(method).lower() if method else ""
+                    if "efectivo" in mlow or mlow == "cash" or "cash" in mlow:
+                        cash_total += tot
+                    elif "transfer" in mlow or "dep" in mlow or "transferencia" in mlow or "bank" in mlow or "tarjeta" in mlow:
+                        transfer_total += tot
+            
+                cash_in_var.set(f"${format_money(cash_total)}")
+                transfer_in_var.set(f"${format_money(transfer_total)}")
+            
+                # pedidos pagados
+                paid_rows = get_paid_orders_for_period(conn, start_dt, end_dt) or []
+                paid_total = sum_paid_orders_for_period(conn, start_dt, end_dt) or 0
+                for r in paid_rows:
+                    rr = dict(r) if hasattr(r, 'keys') else r
+                    paid_tree.insert('', tk.END, values=(rr.get('id') if isinstance(rr, dict) else rr[0],
+                                                         rr.get('customer_name') if isinstance(rr, dict) else rr[1],
+                                                         f"${format_money(rr.get('amount') if isinstance(rr, dict) else rr[2])}",
+                                                         rr.get('note') if isinstance(rr, dict) else rr[3],
+                                                         rr.get('created_at') if isinstance(rr, dict) else rr[4]))
+                paid_orders_var.set(f"-${format_money(paid_total)}")
+            
+                # ajustes (tabla adjustments) -> intentamos leer monto con detección tolerante
                 try:
-                    sale_id = save_sale(items)
-                
+                    adjustments = get_adjustments_for_period(conn, start_dt, end_dt) or []
+                    adj_total = sum_adjustments_for_period(conn, start_dt, end_dt) or 0
+                    adj_total = abs(int(adj_total))
+                except Exception as ex:
+                    adjustments = []
+                    adj_total = 0
+                    print("Error cargando ajustes:", ex)
+            
+                # outflows (salidas) -> get_outflows_in_range devuelve (rows, total)
+                try:
+                    # get_outflows_in_range espera fechas tipo 'YYYY-MM-DD'; extraemos la parte fecha
+                    s_date = (start_dt.split(" ")[0]) if start_dt and " " in start_dt else start_dt
+                    e_date = (end_dt.split(" ")[0]) if end_dt and " " in end_dt else end_dt
+                    out_rows, out_total = get_outflows_in_range(s_date, e_date)
+                    outflows = out_rows or []
+                    outflows_total = int(out_total or 0)
+                except Exception as ex:
+                    outflows = []
+                    outflows_total = 0
+                    print("Error cargando outflows:", ex)
+            
+                # mostrar detalles: primero ajustes, luego outflows (como "Salida")
+                for a in adjustments:
+                    aa = dict(a) if hasattr(a, 'keys') else a
+                    try:
+                        amt = aa.get('amount') if isinstance(aa, dict) else (a[3] if len(a)>3 else 0)
+                        amt_int = abs(int(amt))
+                    except:
+                        try:
+                            amt_int = abs(int(a[3]))
+                        except:
+                            amt_int = 0
+                    adj_tree.insert('', tk.END, values=(aa.get('id') if isinstance(aa, dict) else aa[0],
+                                                        aa.get('kind') if isinstance(aa, dict) else aa[1],
+                                                        aa.get('note') if isinstance(aa, dict) else aa[2],
+                                                        f"${format_money(amt_int)}",
+                                                        aa.get('user') if isinstance(aa, dict) else (aa[4] if len(a)>4 else ""),
+                                                        aa.get('created_at') if isinstance(aa, dict) else (aa[5] if len(a)>5 else "")))
+            
+                for o in outflows:
+                    oo = dict(o) if hasattr(o, 'keys') else o
+                    oid = oo.get('id') if isinstance(oo, dict) else (o[0] if len(o)>0 else "")
+                    when = oo.get('created_at') if isinstance(oo, dict) else (o[1] if len(o)>1 else "")
+                    amt = oo.get('amount') if isinstance(oo, dict) else (o[2] if len(o)>2 else 0)
+                    desc = oo.get('description') if isinstance(oo, dict) else (o[3] if len(o)>3 else "")
+                    try:
+                        amt_int = abs(int(amt))
+                    except:
+                        try: amt_int = abs(int(float(amt)))
+                        except: amt_int = 0
+                    adj_tree.insert('', tk.END, values=(oid, "Salida", desc or "", f"${format_money(amt_int)}", "", when))
+            
+                # TOTAL gastos que deben restar del efectivo: ajustes + outflows
+                total_adjustments_for_closure = adj_total + outflows_total
+                expenses_var.set(f"-${format_money(total_adjustments_for_closure)}")
+            
+                # créditos / deudas
+                cr_total, cr_balance = sum_credits_for_period(conn, start_dt, end_dt)
+                db_total, db_balance = sum_debts_for_period(conn, start_dt, end_dt)
+                credits_var.set(f"${format_money(cr_total or 0)}")
+                debts_var.set(f"${format_money(db_total or 0)}")
+            
+                # net efectivo disponible (apertura + cash_in - gastos_total - paid_orders)
+                try:
+                    opening = parse_money_to_int(opening_var.get())
+                except:
+                    opening = 0
+                net_cash = opening + cash_total - total_adjustments_for_closure - paid_total
+                net_cash_var.set(f"${format_money(net_cash)}")
+            
+                cash_left = opening + cash_total - total_adjustments_for_closure - paid_total
+                transfer_left = transfer_total
+                cash_left_var.set(f"${format_money(cash_left)}")
+                transfer_left_var.set(f"${format_money(transfer_left)}")
+            
+                # guardar estado (para export / persistir)
+                win._closure_state = {
+                    "start": start_dt, "end": end_dt,
+                    "total_sales": total_sales,
+                    "cash_in": cash_total, "transfer_in": transfer_total,
+                    "paid_orders_total": paid_total,
+                    "adjustments_total": adj_total,
+                    "outflows_total": outflows_total,
+                    "adjustments_and_outflows_total": total_adjustments_for_closure,
+                    "credits_total": cr_total, "debts_total": db_total,
+                    "payments_summary": payments_summary
+                }
+            
+
+
+
+            def do_register_closure():
+                st = getattr(win, "_closure_state", None)
+                if not st:
+                    messagebox.showwarning("Aviso", "Primero calcula el resumen"); return
+                try:
+                    opening = parse_money_to_int(opening_var.get())
+                    counted = parse_money_to_int(counted_var.get())
+                except:
+                    messagebox.showwarning("Valores", "Valores inválidos"); return
+    
+                try:
+                    # usar helper save_cash_closure para persistir (ya definido en tu archivo)
+                    ps = st.get('payments_summary', {})
+                    cid = save_cash_closure(
+                        getattr(self, 'current_user', 'cajero'),
+                        st['start'],
+                        st['end'],
+                        opening,
+                        st['cash_in'],
+                        st['adjustments_total'],    # cash_expenses -> guardamos ajustes como gastos
+                        counted,
+                        st['total_sales'],
+                        ps,
+                        notes_var.get().strip()
+                    )
                 except Exception as e:
-                    messagebox.showerror("Error", f"No se pudo guardar la venta: {e}")
-                    return
+                    messagebox.showerror("Error", f"No se pudo guardar cierre: {e}"); return
     
-                change = rec - total
-                # mostrar resumen
-                messagebox.showinfo(
-                    "Venta realizada",
-                    f"Venta registrada (ID: {sale_id})\n"
-                    f"Total: ${int(total):,}".replace(",", ".") + "\n"
-                    f"Recibido: ${int(rec):,}".replace(",", ".") + "\n"
-                    f"Devolución: ${int(change):,}".replace(",", ".")
-                )
-                
+                # opcional: exportar CSV inmediatamente
+                if messagebox.askyesno("Cierre guardado", f"Cierre registrado (ID: {cid}). ¿Exportar CSV?"):
+                    from tkinter import filedialog
+                    path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"cash_closure_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                    if path:
+                        summary = {
+                            "closed_at": datetime.now().isoformat(sep=' ', timespec='seconds'),
+                            "total_sales": st['total_sales'],
+                            "cash_in": st['cash_in'],
+                            "transfer_in": st['transfer_in'],
+                            "paid_orders_total": st['paid_orders_total'],
+                            "adjustments_total": st['adjustments_total'],
+                            "credits_total": st['credits_total'],
+                            "debts_total": st['debts_total'],
+                            "opening": opening,
+                            "counted": counted,
+                            "cash_diff": counted - (opening + st['cash_in'] - st['adjustments_total'] - st['paid_orders_total'])
+                        }
+                        
+                        lists = {
+                            "paid_orders": get_paid_orders_for_period(conn, st['start'], st['end']),
+                            "adjustments": get_adjustments_for_period(conn, st['start'], st['end']),
+                            "payments": get_payments_summary_for_period(conn, st['start'], st['end'])
+                        }
+                        try:
+                            export_cash_closure_csv(path, summary, lists)
+                            messagebox.showinfo("Exportado", f"CSV guardado en:\n{path}")
+                        except Exception as e:
+                            messagebox.showerror("Error export", str(e))
     
-                # limpiar carrito y actualizar UI
-                self.cart.clear()
-                self.refresh_cart()
-                # si implementaste badges en botones
+                messagebox.showinfo("Cierre", f"Cierre registrado (ID: {cid}). Efectivo contado: ${format_money(counted)}.")
+                # tras guardar, sugerir usar contado como apertura siguiente (no borra ventas)
                 try:
-                    self.update_category_buttons_state()
-                except Exception:
-                    pass
-    
-                # refrescar lista productos (stock actualizado)
-                try:
-                    self.load_products()
-                except Exception:
-                    pass
-    
-                # cerrar ventana de pago
-                try:
-                    win.destroy()
+                    opening_var.set(str(counted))
                 except:
                     pass
+                win.destroy()
     
-            # Bindings: Enter para finalizar, Esc para cerrar
-            received_entry.bind('<Return>', finalize_payment)
-            win.bind('<Return>', finalize_payment)
-            win.bind('<Escape>', lambda e: win.destroy())
+            def do_export_csv():
+                st = getattr(win, "_closure_state", None)
+                if not st:
+                    messagebox.showwarning("Aviso", "Primero calcula el resumen"); return
+                from tkinter import filedialog
+                path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=f"cash_closure_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                if not path: return
+                summary = {
+                    "closed_at": datetime.now().isoformat(sep=' ', timespec='seconds'),
+                    "total_sales": st['total_sales'],
+                    "cash_in": st['cash_in'],
+                    "transfer_in": st['transfer_in'],
+                    "paid_orders_total": st['paid_orders_total'],
+                    "adjustments_total": st['adjustments_total'],
+                    "credits_total": st['credits_total'],
+                    "debts_total": st['debts_total'],
+                }
+                lists = {
+                    "paid_orders": get_paid_orders_for_period(conn, st['start'], st['end']),
+                    "adjustments": get_adjustments_for_period(conn, st['start'], st['end']),
+                    "payments": get_payments_summary_for_period(conn, st['start'], st['end'])
+                }
+                try:
+                    export_cash_closure_csv(path, summary, lists)
+                    messagebox.showinfo("Exportado", f"CSV guardado en:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("Error export", str(e))
     
-            # Botones
-            btn_frame = ttk.Frame(win)
-            btn_frame.pack(fill=tk.X, pady=(8,10))
-            ttk.Button(btn_frame, text="Confirmar (Enter)", command=finalize_payment).pack(side=tk.RIGHT, padx=8)
-            ttk.Button(btn_frame, text="Cancelar (Esc)", command=win.destroy).pack(side=tk.RIGHT)
-           
-
-
-    
-            # calcular cambio inicial
-            compute_change()
-    
+            win.bind("<Escape>", lambda e: win.destroy())
+            win.after(120, lambda: (win.lift(), win.focus_force()))
             return win
-        
     
-        # abrir la ventana de pago (solo una instancia)
-        return self.open_window_once('payment', creator)
+        # open once helper if present
+        if hasattr(self, 'open_window_once'):
+            return self.open_window_once("cash_closure", creator)
+        else:
+            return creator()
+    
 
-    
-    
-    
-    
+
+
     def checkout(self):
-        """
-        Checkout sencillo:
-         - Lista navegable con flechas: Cobrar exacto / Ingresar recibido / Ingresar devuelta
-         - Enter en la lista: si modo exacto finaliza; si modo recibido/devuelta pasa al entry
-         - En 'Ingresar recibido' escribes cuánto te pagan (ej. 100000) y calcula la devolución en tiempo real
-         - Enter en el entry confirma la venta
-        """
         if not self.cart:
             messagebox.showinfo("Carrito vacío", "No hay items para cobrar.")
             return
-    
         total = sum(item.total() for item in self.cart.values())
     
         def creator():
             win = tk.Toplevel(self.root)
-            win.title("Cobro (simple)")
-            win.geometry("420x260")
+            win.title("Cobro — Pago múltiple / mixto")
+            win.geometry("520x520")
             win.resizable(False, False)
+            win.lift()
+            win.focus_force()
+            win.grab_set()
     
-            ttk.Label(win, text=f"Total: ${format_money(total)}", font=(None, 13, "bold")).pack(pady=(8,6))
+            ttk.Label(win, text=f"Total a cobrar: ${format_money(total)}", font=(None, 13, "bold")).pack(pady=(8,6))
     
-            # Lista de modos (navegables con flechas)
-            modes = ["Cobrar exacto", "Ingresar recibido", "Ingresar devuelta"]
-            lb = tk.Listbox(win, height=len(modes), exportselection=False)
-            for m in modes:
-                lb.insert(tk.END, m)
-            lb.pack(fill=tk.X, padx=12)
-            lb.selection_set(0)
-            lb.focus_set()
+            # Frame de pagos añadidos
+            payments_frame = ttk.LabelFrame(win, text="Pagos agregados", padding=6)
+            payments_frame.pack(fill=tk.BOTH, padx=10, pady=(0,8), expand=False)
+            payments_tree = ttk.Treeview(payments_frame, columns=('method','amount','details'), show='headings', height=5)
+            payments_tree.heading('method', text='Método'); payments_tree.heading('amount', text='Monto'); payments_tree.heading('details', text='Detalles')
+            payments_tree.column('amount', anchor=tk.E, width=120)
+            payments_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            ps_scroll = ttk.Scrollbar(payments_frame, orient='vertical', command=payments_tree.yview)
+            payments_tree.configure(yscroll=ps_scroll.set)
+            ps_scroll.pack(side=tk.RIGHT, fill=tk.Y)
     
-            # Campo para monto (usado para recibido o devuelta según modo)
-            frame = ttk.Frame(win, padding=(12,8))
-            frame.pack(fill=tk.X)
-            ttk.Label(frame, text="Monto (si aplica):").grid(row=0, column=0, sticky=tk.W)
-            amount_var = tk.StringVar(value=format_money(total))
-            amount_entry = ttk.Entry(frame, textvariable=amount_var)
-            amount_entry.grid(row=0, column=1, sticky=tk.EW, padx=(6,0))
-            frame.columnconfigure(1, weight=1)
+            # Frame para crear un pago nuevo
+            newf = ttk.Frame(win, padding=8)
+            newf.pack(fill=tk.X, padx=10)
+            ttk.Label(newf, text="Método:").grid(row=0, column=0, sticky=tk.W)
+            method_var = tk.StringVar(value="Efectivo")   # <--- por defecto Efectivo
+            methods = ["Efectivo", "Tarjeta", "Transferencia"]
+            method_combo = ttk.Combobox(newf, textvariable=method_var, values=methods, state='readonly', width=18)
+            method_combo.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
     
-            # Label para mostrar devolución en tiempo real
-            change_var = tk.StringVar(value="0")
-            ttk.Label(frame, text="Devolución:").grid(row=1, column=0, sticky=tk.W, pady=(8,0))
-            ttk.Label(frame, textvariable=change_var, font=(None, 11, "bold")).grid(row=1, column=1, sticky=tk.E, pady=(8,0))
+            ttk.Label(newf, text="Monto:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+            amount_var = tk.StringVar(value=format_money(total))  # <--- por defecto el total
+            amount_entry = ttk.Entry(newf, textvariable=amount_var)
+            amount_entry.grid(row=1, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
     
-            # Mensaje de estado
-            status_var = tk.StringVar(value="")
-            ttk.Label(win, textvariable=status_var, foreground="red").pack(pady=(6,0))
+            ttk.Label(newf, text="Detalles (opcional):").grid(row=2, column=0, sticky=tk.W, pady=(6,0))
+            details_var = tk.StringVar()
+            details_entry = ttk.Entry(newf, textvariable=details_var, width=30)
+            details_entry.grid(row=2, column=1, sticky=tk.W, padx=(6,0), pady=(6,0))
     
-            # Helpers
-            def update_change_display():
-                idxs = lb.curselection()
-                mode = lb.get(idxs[0]) if idxs else modes[0]
-                val = parse_money_to_int(amount_var.get())
-                if mode == "Cobrar exacto":
-                    change_var.set("0")
-                    status_var.set("")
-                elif mode == "Ingresar recibido":
-                    ch = val - total
-                    change_var.set(format_money(ch) if ch >= 0 else "—")
-                    status_var.set("" if val >= total else "Monto insuficiente")
-                else:  # "Ingresar devuelta"
-                    # interpretamos el campo como la devuelta deseada
-                    dev = val
-                    change_var.set(format_money(dev))
-                    status_var.set("")
-                
+            # botones para añadir/quitar pago
+            btnf = ttk.Frame(win); btnf.pack(fill=tk.X, padx=10, pady=(6,4))
+            def add_payment_line(event=None):
+                try:
+                    amt = parse_money_to_int(amount_var.get())
+                except:
+                    messagebox.showwarning("Monto inválido", "Ingresa un monto válido"); return
+                m = method_var.get() or "Efectivo"
+                d = details_var.get().strip() or ""
+                payments_tree.insert('', tk.END, values=(m, f"${format_money(amt)}", d))
+                details_var.set("")
+                amount_var.set("")  # para siguiente entrada rápida
+                update_totals_display()
     
-            # Cuando se presiona Enter en la lista
-            def on_list_enter(event=None):
-                sel = lb.curselection()
+            def remove_payment_line(event=None):
+                sel = payments_tree.selection()
                 if not sel:
                     return
-                mode = lb.get(sel[0])
-                if mode == "Cobrar exacto":
-                    finalize_payment_exact()
-                else:
-                    # pasar foco al entry para escribir monto
-                    amount_entry.focus_set()
+                payments_tree.delete(sel[0])
+                update_totals_display()
+    
+            ttk.Button(btnf, text="Agregar pago", command=add_payment_line).pack(side=tk.LEFT, padx=6)
+            ttk.Button(btnf, text="Quitar seleccionado", command=remove_payment_line).pack(side=tk.LEFT, padx=6)
+    
+            # Totales abajo
+            totalsf = ttk.Frame(win, padding=8); totalsf.pack(fill=tk.X, padx=10)
+            paid_var = tk.StringVar(value=f"${format_money(0)}")
+            change_var = tk.StringVar(value=f"${format_money(0)}")
+            ttk.Label(totalsf, text="Total pagado:").grid(row=0, column=0, sticky=tk.W)
+            ttk.Label(totalsf, textvariable=paid_var).grid(row=0, column=1, sticky=tk.E)
+            ttk.Label(totalsf, text="Devolución:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+            ttk.Label(totalsf, textvariable=change_var).grid(row=1, column=1, sticky=tk.E, pady=(6,0))
+    
+            def update_totals_display():
+                total_paid = 0
+                for iid in payments_tree.get_children():
+                    vals = payments_tree.item(iid, 'values')
+                    amt_str = str(vals[1]).replace("$","").strip()
                     try:
-                        amount_entry.selection_range(0, tk.END)
+                        amt = parse_money_to_int(amt_str)
+                    except:
+                        amt = 0
+                    total_paid += int(amt)
+                paid_var.set(f"${format_money(total_paid)}")
+                ch = total_paid - int(total)
+                change_var.set(f"${format_money(ch)}" if ch >= 0 else f"-${format_money(abs(ch))}")
+    
+            # botón para pagar exacto (efectivo restante)
+            def add_exact_cash():
+                total_paid = 0
+                for iid in payments_tree.get_children():
+                    vals = payments_tree.item(iid, 'values')
+                    amt_str = str(vals[1]).replace("$","").strip()
+                    try:
+                        total_paid += parse_money_to_int(amt_str)
                     except:
                         pass
+                remaining = int(total) - total_paid
+                if remaining <= 0:
+                    messagebox.showinfo("Ya pagado", "El total ya está cubierto o excedido.")
+                    return
+                payments_tree.insert('', tk.END, values=("Efectivo", f"${format_money(remaining)}", "Cobro exacto"))
+                update_totals_display()
     
-            lb.bind("<Return>", on_list_enter)
-            lb.bind("<Double-1>", on_list_enter)
+            ttk.Button(win, text="Cobrar exacto (efectivo restante)", command=add_exact_cash).pack(fill=tk.X, padx=10, pady=(6,0))
     
-            # Enter en el entry finaliza según modo
-            def on_entry_enter(event=None):
-                sel = lb.curselection()
-                mode = lb.get(sel[0]) if sel else modes[0]
-                if mode == "Ingresar recibido":
-                    finalize_payment_received()
-                elif mode == "Ingresar devuelta":
-                    finalize_payment_change()
-    
-            amount_entry.bind("<Return>", on_entry_enter)
-            amount_var.trace_add("write", lambda *a: update_change_display())
-    
-            # Finalizadores
-            def finalize_payment_exact():
+            # Finalizadores: guardar venta + pagos
+            def finalize_sale(close_after=True):
                 # construir items desde el carrito actual
                 items = []
                 for it in self.cart.values():
@@ -3629,54 +5461,121 @@ class POSApp:
                         "qty": it.qty,
                         "category_id": it.category_id
                     })
-            
-                # intentar guardar la venta
+                # preparar pagos desde el tree
+                payments = []
+                total_paid = 0
+                for iid in payments_tree.get_children():
+                    mth, amt_s, det = payments_tree.item(iid, 'values')
+                    amt = parse_money_to_int(str(amt_s).replace("$",""))
+                    payments.append({"method": mth, "amount": int(amt), "details": det})
+                    total_paid += int(amt)
+    
+                # validar: si no alcanza, preguntar si crear credito/fiado o abortar
+                if total_paid < int(total):
+                    if messagebox.askyesno("Saldo insuficiente", "El monto pagado es menor que el total. ¿Deseas registrar la venta como crédito/fiado para el cliente?"):
+                        # Crear crédito: pedimos seleccionar cliente (simple prompt)
+                        cwin = tk.Toplevel(win)
+                        cwin.title("Seleccionar cliente para fiado")
+                        ttk.Label(cwin, text="Ingresa ID del cliente o busca:").pack(padx=8,pady=6)
+                        cid_var = tk.StringVar()
+                        ttk.Entry(cwin, textvariable=cid_var).pack(padx=8,pady=6)
+                        def do_create_credit():
+                            try:
+                                cid = int(cid_var.get().strip())
+                            except:
+                                messagebox.showwarning("ID inválido", "Ingresa el ID numérico del cliente"); return
+                            try:
+                                sale_id = save_sale(items)
+                            except Exception as e:
+                                messagebox.showerror("Error", f"No se pudo guardar la venta: {e}"); return
+                            # guardar pagos parciales si existen
+                            for p in payments:
+                                try:
+                                    add_sale_payment(sale_id, p['method'], p['amount'], p.get('details'))
+                                except Exception:
+                                    pass
+                            credit_amount = int(total) - total_paid
+                            create_credit(cid, credit_amount, reference=str(sale_id), description="Venta a crédito (parcial)", due_date=None)
+                            messagebox.showinfo("Venta y crédito registrados", f"Venta ID {sale_id} y crédito creado por ${format_money(credit_amount)}")
+                            cwin.destroy()
+                            if close_after: win.destroy()
+                            self.cart.clear(); self.refresh_cart()
+                        ttk.Button(cwin, text="Crear crédito y guardar", command=do_create_credit).pack(padx=8,pady=6)
+                    else:
+                        messagebox.showwarning("Pago incompleto", "No se realizó el cobro.")
+                    return
+    
+                # si alcanza o excede, proceed
                 try:
                     sale_id = save_sale(items)
-                except ValueError as e:
-                    messagebox.showerror("Error al cobrar", str(e))
-                    return
                 except Exception as e:
-                    messagebox.showerror("Error", f"Ocurrió un error al guardar la venta:\n{e}")
-                    return
-            
+                    messagebox.showerror("Error al guardar venta", str(e)); return
+    
+                # guardar pagos en BD
+                for p in payments:
+                    try:
+                        add_sale_payment(sale_id, p['method'], p['amount'], p.get('details'))
+                    except Exception as e:
+                        # si falla un pago, lo registramos en log y continuamos (no abortamos todo)
+                        print("Error guardando pago:", e)
+    
+                # marcar venta como pagada si corresponde
+                try:
+                    if total_paid >= int(total):
+                        # intenta usar helper si existe
+                        if hasattr(self, 'mark_sale_paid'):
+                            try:
+                                self.mark_sale_paid(sale_id)
+                            except:
+                                pass
+                        else:
+                            # fallback: actualizar directamente la tabla sales (usa conn global)
+                            try:
+                                cur = conn.cursor()
+                                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                cur.execute("UPDATE sales SET status = ?, paid_at = ? WHERE id = ?", ('paid', now, sale_id))
+                                conn.commit()
+                            except Exception:
+                                try: conn.rollback()
+                                except: pass
+                except Exception:
+                    pass
+    
                 # actualizar productos (mostrar nuevo stock)
                 try:
                     self.load_products()
                 except Exception:
                     pass
-            
+    
                 # preparar datos para el recibo
                 sale_rows = []
                 for it in items:
                     price_int = int(round(float(it.get('price', 0))))
                     qty_int = int(it.get('qty', 0))
                     sale_rows.append({
-                        "product_code": it.get('code'),
                         "product_name": it.get('name'),
                         "qty": qty_int,
                         "price": price_int,
-                        "subtotal": price_int * qty_int,
-                        
+                        "subtotal": price_int * qty_int
                     })
-            
+    
                 total_amount = sum(r["subtotal"] for r in sale_rows)
-                rec_amount = total_amount
-                change_amount = 0
-            
+                rec_amount = total_paid
+                change_amount = max(0, total_paid - int(total))
+    
                 # ventana de confirmación (una sola)
                 def show_success_window():
                     win2 = tk.Toplevel(self.root)
                     win2.title("Venta realizada ✅")
                     win2.geometry("380x250")
                     win2.resizable(False, False)
-            
+    
                     ttk.Label(win2, text="✅ Venta registrada correctamente", font=(None, 12, "bold")).pack(pady=(12,4))
                     ttk.Label(win2, text=f"ID: {sale_id}", font=(None, 10)).pack()
                     ttk.Label(win2, text=f"Total: ${format_money(total_amount)}", font=(None, 10)).pack()
                     ttk.Label(win2, text=f"Recibido: ${format_money(rec_amount)}", font=(None, 10)).pack()
                     ttk.Label(win2, text=f"Devuelta: ${format_money(change_amount)}", font=(None, 10)).pack(pady=(0,8))
-            
+    
                     def open_preview():
                         try:
                             self.open_receipt_preview(
@@ -3685,11 +5584,11 @@ class POSApp:
                                 total_amount,
                                 rec_amount,
                                 change_amount,
-                                company_name="Variedades El Sembrador"
+                                company_name="Mi Negocio"
                             )
                         except Exception as e:
                             messagebox.showerror("Error", f"No se pudo abrir la vista previa:\n{e}")
-            
+    
                     def close_window():
                         try:
                             win2.destroy()
@@ -3709,281 +5608,142 @@ class POSApp:
                         except: pass
                         try: self.load_products()
                         except: pass
-            
+    
                     btn_frame = ttk.Frame(win2)
                     btn_frame.pack(pady=8)
                     ttk.Button(btn_frame, text="🧾 Vista previa recibo", command=open_preview).pack(side=tk.LEFT, padx=6)
                     cancel_btn = ttk.Button(btn_frame, text="Cancelar / Cerrar", command=close_window)
                     cancel_btn.pack(side=tk.LEFT, padx=6)
                     cancel_btn.focus_set()
-            
                     win2.bind("<Return>", lambda e: close_window())
                     win2.bind("<Escape>", lambda e: close_window())
-            
+    
                     return win2
-            
+    
                 show_success_window()
-            
-            
-            def finalize_payment_received():
-                try:
-                    rec = parse_money_to_int(amount_var.get())
-                except Exception:
-                    messagebox.showwarning("Error", "Monto recibido inválido")
-                    return
-            
-                if rec < total:
-                    messagebox.showwarning("Error", f"Monto insuficiente. Total: ${format_money(total)}")
-                    return
-            
-                items = []
-                for it in self.cart.values():
-                    items.append({
-                        "product_id": it.product_id,
-                        "code": it.code,
-                        "name": it.name,
-                        "price": it.price,
-                        "qty": it.qty,
-                        "category_id": it.category_id
-                    })
-                try:
-                    sale_id = save_sale(items)
-                except ValueError as e:
-                    messagebox.showerror("Error al cobrar", str(e)); return
-                except Exception as e:
-                    messagebox.showerror("Error", f"Ocurrió un error al guardar la venta:\n{e}"); return
-            
-                # actualizar productos
-                try:
-                    self.load_products()
-                except Exception:
-                    pass
-            
-                change = rec - total
-                rec_amount = rec
-                change_amount = change
-            
-                sale_rows = []
-                for it in items:
-                    price_int = int(round(float(it.get('price', 0))))
-                    qty_int = int(it.get('qty', 0))
-                    sale_rows.append({
-                        "product_code": it.get('code'),
-                        "product_name": it.get('name'),
-                        "qty": qty_int,
-                        "price": price_int,
-                        "subtotal": price_int * qty_int,
-                        
-                    })
-            
-                total_amount = sum(r["subtotal"] for r in sale_rows)
-            
-                def show_success_windowss():
-                    win2 = tk.Toplevel(self.root)
-                    win2.title("Venta realizada ✅")
-                    win2.geometry("380x250")
-                    win2.resizable(False, False)
-            
-                    ttk.Label(win2, text="✅ Venta registrada correctamente ", font=(None, 12, "bold")).pack(pady=(12,4))
-                    ttk.Label(win2, text=f"ID: {sale_id}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Total: ${format_money(total_amount)}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Recibido: ${format_money(rec_amount)}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Devuelta: ${format_money(change_amount)}", font=(None, 10)).pack(pady=(0,8))
-            
-                    def open_preview():
-                        try:
-                            self.open_receipt_preview(
-                                sale_id,
-                                sale_rows,
-                                total_amount,
-                                rec_amount,
-                                change_amount,
-                                company_name="Mi Negocio"
-                            )
-                        except Exception as e:
-                            messagebox.showerror("Error", f"No se pudo abrir la vista previa:\n{e}")
-            
-                    def close_window():
-                        try:
-                            win2.destroy()
-                        except:
-                            pass
-                        try:
-                            if win.winfo_exists():
-                                win.destroy()
-                        except:
-                            pass
-                        self.cart.clear()
-                        try: self.refresh_cart()
-                        except: pass
-                        try: self.update_category_buttons_state()
-                        except: pass
-                        try: self.load_products()
-                        except: pass
-            
-                    btn_frame = ttk.Frame(win2)
-                    btn_frame.pack(pady=8)
-                    ttk.Button(btn_frame, text="🧾 Vista previa recibo", command=open_preview).pack(side=tk.LEFT, padx=6)
-                    cancel_btn = ttk.Button(btn_frame, text="Cancelar / Cerrar", command=close_window)
-                    cancel_btn.pack(side=tk.LEFT, padx=6)
-                    cancel_btn.focus_set()
-            
-                    win2.bind("<Return>", lambda e: close_window())
-                    win2.bind("<Escape>", lambda e: close_window())
-            
-                    return win2
-            
-                show_success_windowss()
-            
-            
-            def finalize_payment_change():
-                try:
-                    dev = parse_money_to_int(amount_var.get())
-                except Exception:
-                    messagebox.showwarning("Error", "Cantidad inválida")
-                    return
-            
-                rec = total + dev
-            
-                items = []
-                for it in self.cart.values():
-                    items.append({
-                        "product_id": it.product_id,
-                        "code": it.code,
-                        "name": it.name,
-                        "price": it.price,
-                        "qty": it.qty,
-                        "category_id": it.category_id
-                    })
-                try:
-                    sale_id = save_sale(items)
-                except ValueError as e:
-                    messagebox.showerror("Error al cobrar", str(e)); return
-                except Exception as e:
-                    messagebox.showerror("Error", f"Ocurrió un error al guardar la venta:\n{e}"); return
-            
-                # actualizar productos
-                try:
-                    self.load_products()
-                except Exception:
-                    pass
-            
-                rec_amount = rec
-                change_amount = dev
-            
-                sale_rows = []
-                for it in items:
-                    price_int = int(round(float(it.get('price', 0))))
-                    qty_int = int(it.get('qty', 0))
-                    sale_rows.append({
-                        "product_code": it.get('code'),
-                        "product_name": it.get('name'),
-                        "qty": qty_int,
-                        "price": price_int,
-                        "subtotal": price_int * qty_int,
-                        
-                    })
-            
-                total_amount = sum(r["subtotal"] for r in sale_rows)
-            
-                def show_success_windows():
-                    win2 = tk.Toplevel(self.root)
-                    win2.title("Venta realizada ✅")
-                    win2.geometry("380x250")
-                    win2.resizable(False, False)
-            
-                    ttk.Label(win2, text="✅ Venta registrada correctamente", font=(None, 12, "bold")).pack(pady=(12,4))
-                    ttk.Label(win2, text=f"ID: {sale_id}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Total: ${format_money(total_amount)}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Recibido: ${format_money(rec_amount)}", font=(None, 10)).pack()
-                    ttk.Label(win2, text=f"Devuelta: ${format_money(change_amount)}", font=(None, 10)).pack(pady=(0,8))
-            
-                    def open_preview():
-                        try:
-                            self.open_receipt_preview(
-                                sale_id,
-                                sale_rows,
-                                total_amount,
-                                rec_amount,
-                                change_amount,
-                                company_name="Mi Negocio"
-                            )
-                        except Exception as e:
-                            messagebox.showerror("Error", f"No se pudo abrir la vista previa:\n{e}")
-            
-                    def close_window():
-                        try:
-                            win2.destroy()
-                        except:
-                            pass
-                        try:
-                            if win.winfo_exists():
-                                win.destroy()
-                        except:
-                            pass
-                        self.cart.clear()
-                        try: self.refresh_cart()
-                        except: pass
-                        try: self.update_category_buttons_state()
-                        except: pass
-                        try: self.load_products()
-                        except: pass
-            
-                    btn_frame = ttk.Frame(win2)
-                    btn_frame.pack(pady=8)
-                    ttk.Button(btn_frame, text="🧾 Vista previa recibo", command=open_preview).pack(side=tk.LEFT, padx=6)
-                    cancel_btn = ttk.Button(btn_frame, text="Cancelar / Cerrar", command=close_window)
-                    cancel_btn.pack(side=tk.LEFT, padx=6)
-                    cancel_btn.focus_set()
-            
-                    win2.bind("<Return>", lambda e: close_window())
-                    win2.bind("<Escape>", lambda e: close_window())
-            
-                    return win2
-            
-                show_success_windows()
-            
-                dev = parse_money_to_int(amount_var.get())
-                rec = total + dev
-                items = []
-                for it in self.cart.values():
-                    items.append({
-                        "product_id": it.product_id,
-                        "code": it.code,
-                        "name": it.name,
-                        "price": it.price,
-                        "qty": it.qty,
-                        "category_id": it.category_id
-                    })
-                try:
-                    sale_id = save_sale(items)
-                except ValueError as e:
-                    messagebox.showerror("Error al cobrar", str(e))
-                try:
-                    self.load_products()
-                except Exception:
-                    pass
-                    return
-                # messagebox.showinfo("Venta realizada",
-                #                     f"Venta registrada (ID: {sale_id})\nTotal: ${format_money(total)}\nRecibido: ${format_money(rec)}\nDevolución: ${format_money(dev)}")
-                self.cart.clear()
-                self.refresh_cart()
+    
+                # limpiar y cerrar
+                self.cart.clear(); self.refresh_cart()
                 try: self.update_category_buttons_state()
                 except: pass
-                win.destroy()
+                if close_after: win.destroy()
+                return sale_id
     
-            # Teclas: Esc cierra, Enter actúa según foco (list/entry)
-            win.bind("<Escape>", lambda e: win.destroy())
-            win.bind("<Return>", lambda e: on_list_enter() if win.focus_get() == lb else on_entry_enter())
-            
+            # finalize_btn = ttk.Button(win, text="Finalizar y registrar venta", command=lambda: finalize_sale(True))
+            finalize_btn = ttk.Button(win, text="Finalizar y registrar venta", command=lambda: on_enter_quickpay(True))
+            finalize_btn.pack(fill=tk.X, padx=10, pady=(8,10))
     
-            # iniciar mostrando cambio según default
-            update_change_display()
+            # Bindings
+            payments_tree.bind('<Delete>', lambda e: remove_payment_line())
+            win.bind('<Escape>', lambda e: win.destroy())
+            amount_entry.bind('<Return>', lambda e: add_payment_line())
+    
+            # ---- Comportamiento rápido con ENTER: si presionas Enter y no hay pagos añadidos,
+            # ---- añade el pago en efectivo por el restante y finaliza automáticamente.
+            def on_enter_quickpay(event=None):
+                focused = win.focus_get()
+                # si el foco está en amount_entry, Enter añade esa línea (ya enlazado)
+                if focused is amount_entry:
+                    add_payment_line()
+                    return "break"
+                # si hay ya pagos añadidos, simplemente finalizamos
+                if payments_tree.get_children():
+                    finalize_sale(True)
+                else:
+                    # no hay pagos: añadir efectivo exacto y finalizar
+                    add_exact_cash()
+                    finalize_sale(True)
+                return "break"
+    
+            # bind global dentro de la ventana (solo esta win)
+            win.bind("<Return>", on_enter_quickpay)
+    
+            # actualizar totales cuando se inserte/elimine
+            win.after(200, update_totals_display)
+    
             return win
     
         return self.open_window_once("simple_payment", creator)
     
     
+
+
+
+
+    def show_sale_done_window(self, sale_id, total, received=None, change=None, sale_rows=None, company_name="Mi Negocio"):
+        """
+        Muestra ventana al finalizar venta con opción (opcional) de ver vista previa.
+        - Cerrar será el botón por defecto y capturará Enter.
+        - sale_rows: lista de dicts como espera open_receipt_preview.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("Venta realizada")
+        win.geometry("420x180")
+        win.resizable(False, False)
+        try:
+            win.transient(self.root)
+        except: pass
+    
+        # Asegurar modal y foco
+        win.lift()
+        win.focus_force()
+        try:
+            win.grab_set()
+        except: pass
+    
+        # Contenido
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+    
+        ttk.Label(frm, text=f"Venta registrada (ID: {sale_id})", font=(None, 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(frm, text=f"Total: ${format_money(total)}").pack(anchor=tk.W, pady=(6,0))
+        if received is not None:
+            ttk.Label(frm, text=f"Recibido: ${format_money(received)}").pack(anchor=tk.W)
+        if change is not None:
+            ttk.Label(frm, text=f"Devolución: ${format_money(change)}").pack(anchor=tk.W)
+    
+        # Botones: Preview (opcional) y Cerrar (por defecto)
+        btnf = ttk.Frame(frm)
+        btnf.pack(fill=tk.X, pady=(12,0))
+    
+        def on_close():
+            try:
+                win.grab_release()
+            except:
+                pass
+            win.destroy()
+    
+        def on_preview():
+            # Abrir vista previa si tenemos rows, si no intentamos construir mínimos
+            try:
+                rows = sale_rows
+                if rows is None:
+                    # intentar obtener items desde DB
+                    c = conn.cursor()
+                    c.execute("SELECT product_name as product_name, product_code as product_code, qty, price, (qty*price) as subtotal FROM sale_items WHERE sale_id=?", (sale_id,))
+                    rows = [dict(r) for r in c.fetchall()]
+                # abrir preview (tu función debe aceptar estos parámetros)
+                self.open_receipt_preview(sale_id, rows, total, received=received, change=change, company_name=company_name)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo abrir vista previa: {e}")
+    
+        # Preview solo si hay función disponible
+        preview_btn = ttk.Button(btnf, text="🧾 Vista previa", command=on_preview)
+        preview_btn.pack(side=tk.LEFT, padx=(0,6))
+    
+        # Botón Cerrar (por defecto)
+        close_btn = ttk.Button(btnf, text="Cerrar (Enter)", command=on_close)
+        close_btn.pack(side=tk.RIGHT)
+    
+        # Asegurar que 'Cerrar' sea el widget por defecto capturando Return y dándole foco
+        close_btn.focus_set()
+        win.bind("<Return>", lambda e: on_close())
+        win.bind("<Escape>", lambda e: on_close())
+    
+        # Evitar que Enter en otros widgets cierre inesperadamente si deseas:
+        # por ejemplo, si quieres que Enter en un Entry haga otra cosa, añade excepciones.
+    
+        return win
     
 
 
